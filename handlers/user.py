@@ -1,5 +1,6 @@
+# handlers/user.py
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from config import SUPPORT_GROUP_ID
@@ -13,10 +14,8 @@ router = Router()
 
 class SupportStates(StatesGroup):
     choosing_theme = State()
-    providing_details = State()
-    awaiting_info = State()  # если ИИ запросил доп. инфо
+    in_conversation = State()  # ← ОДНО состояние на весь диалог
 
-# Соответствие кнопок → темам
 THEME_MAP = {
     "Оставить отзыв": "feedback",
     "Проблема с пополнением": "deposit",
@@ -48,12 +47,16 @@ async def theme_chosen(message: Message, state: FSMContext):
         await message.answer("Пожалуйста, выберите тему из меню.")
         return
 
+    # Сбрасываем флаг — новая заявка
+    await update_user(message.from_user.id, first_message_in_ticket=1)
+
     await state.update_data(theme=theme_key, theme_name=theme_text)
-    await state.set_state(SupportStates.providing_details)
+    await state.set_state(SupportStates.in_conversation)
     await message.answer(await load_text("ask_details"))
 
-@router.message(SupportStates.providing_details, F.text | F.photo | F.document | F.video)
-async def handle_user_message(message: Message, state: FSMContext, bot):
+# ✅ ОСНОВНОЙ ХЭНДЛЕР: все сообщения в диалоге
+@router.message(SupportStates.in_conversation, F.text | F.photo | F.document | F.video)
+async def handle_message_in_conversation(message: Message, state: FSMContext, bot):
     user = await get_user(message.from_user.id)
     if not user or user["is_blocked"]:
         await message.answer(await load_text("blocked"))
@@ -62,10 +65,11 @@ async def handle_user_message(message: Message, state: FSMContext, bot):
     data = await state.get_data()
     theme_name = data.get("theme_name", "Неизвестно")
 
-    # Получаем историю (здесь — только последнее сообщение; можно расширить)
-    history = [{"role": "user", "content": message.text or message.caption or ""}]
+    # 1️⃣ Пересылаем ВСЕ сообщения в топик (диалог)
+    await send_to_topic(bot, user, message, theme_name)
 
-    # Запрашиваем ИИ
+    # 2️⃣ Получаем ответ от ИИ на КАЖДОЕ сообщение
+    history = [{"role": "user", "content": message.text or message.caption or ""}]
     ai_response = await ask_ai(
         user_message=message.text or message.caption or "",
         history=history,
@@ -73,37 +77,22 @@ async def handle_user_message(message: Message, state: FSMContext, bot):
         user_id=message.from_user.id
     )
 
-    # Отправляем ответ ИИ пользователю
-    if ai_response["need_more_info"]:
-        await message.answer(ai_response["response_to_user"])
-        await message.answer(ai_response["additional_questions"])
-        await state.set_state(SupportStates.awaiting_info)
-        return
+    # 3️⃣ Отправляем ответ ИИ пользователю
+    #    + уведомление о времени — ТОЛЬКО при first_message_in_ticket
+    response_texts = [ai_response["response_to_user"]]
 
-    elif not ai_response["need_human"]:
-        await message.answer(await load_text("auto_answer_resolved"))
-        await message.answer(ai_response["response_to_user"])
-        return
+    if user.get("first_message_in_ticket") and ai_response.get("estimated_time"):
+        # Формируем уведомление один раз
+        est_time = ai_response["estimated_time"]
+        notice = await load_text("ticket_notice", time=est_time)
+        response_texts.insert(0, notice)
 
-    else:
-        # Нужен человек — пересылаем в топик
-        forwarded_msg_id = await send_to_topic(bot, user, message, theme_name)
-        await message.answer(await load_text("forwarded_to_human"))
-        await state.clear()  # выход из FSM
-        return
+    # Отправляем всё как единое сообщение
+    full_response = "\n\n".join(filter(None, response_texts))
+    await message.answer(full_response)
 
-@router.message(SupportStates.awaiting_info, F.text | F.photo | F.document | F.video)
-async def handle_additional_info(message: Message, state: FSMContext, bot):
-    # Можно отправить доп. инфо в ИИ или сразу в топик
-    user = await get_user(message.from_user.id)
-    if not user or user["is_blocked"]:
-        await message.answer(await load_text("blocked"))
-        return
+    # Сбрасываем флаг после первого сообщения
+    if user.get("first_message_in_ticket"):
+        await update_user(message.from_user.id, first_message_in_ticket=0)
 
-    data = await state.get_data()
-    theme_name = data.get("theme_name", "Неизвестно")
-
-    # Просто пересылаем как продолжение
-    await send_to_topic(bot, user, message, theme_name)
-    await message.answer(await load_text("message_forwarded"))
-    await state.clear()
+    # Продолжаем в том же состоянии — никакого clear()
