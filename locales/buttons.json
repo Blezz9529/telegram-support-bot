@@ -1,0 +1,13 @@
+{
+  "menu": {
+    "leave_feedback": "Оставить отзыв",
+    "deposit_problem": "Проблема с пополнением",
+    "how_to_play": "Как играть",
+    "earn_money": "Хочу заработать",
+    "partnership": "Предлагаю сотрудничество",
+    "other_question": "Другой вопрос"
+  },
+  "inline": {
+    "block": "🚫 Заблокировать"
+  }
+}
