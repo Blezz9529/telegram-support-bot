@@ -32,7 +32,7 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
 
         try:
             genai.configure(api_key=api_key)
-            model_name = "gemini-1.5-flash-002"
+            model_name = "gemini-2.0-flash"
             _gemini_model = genai.GenerativeModel(
                 model_name=model_name,
                 generation_config=GenerationConfig(
