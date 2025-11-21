@@ -35,7 +35,7 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
         try:
             genai.configure(api_key=api_key)
             _gemini_model = genai.GenerativeModel(
-                model_name="gemini-1.5-flash",
+                model_name="gemini-2.0-flash",
                 generation_config=GenerationConfig(
                     temperature=0.3,
                     top_p=0.95,
