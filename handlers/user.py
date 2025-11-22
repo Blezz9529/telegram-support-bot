@@ -7,14 +7,14 @@ from config import SUPPORT_GROUP_ID
 from storages.db import get_user, create_user, update_user
 from services.localization import load_text, load_button
 from services.ai_agent import ask_ai
-from services.forum import send_to_topic
+from services.forum import send_to_topic, get_or_create_topic
 from keyboards.reply import get_main_menu
 
 router = Router()
 
 class SupportStates(StatesGroup):
     choosing_theme = State()
-    in_conversation = State()  # ← ОДНО состояние на весь диалог
+    in_conversation = State()
 
 THEME_MAP = {
     "Оставить отзыв": "feedback",
@@ -47,14 +47,13 @@ async def theme_chosen(message: Message, state: FSMContext):
         await message.answer("Пожалуйста, выберите тему из меню.")
         return
 
-    # Сбрасываем флаг — новая заявка
-    await update_user(message.from_user.id, first_message_in_ticket=1)
+    # 🔑 СБРАСЫВАЕМ ФЛАГ — новая заявка!
+    await update_user(message.from_user.id, first_message_in_ticket=1, theme=theme_key)
 
     await state.update_data(theme=theme_key, theme_name=theme_text)
     await state.set_state(SupportStates.in_conversation)
     await message.answer(await load_text("ask_details"))
 
-# ✅ ОСНОВНОЙ ХЭНДЛЕР: все сообщения в диалоге
 @router.message(SupportStates.in_conversation, F.text | F.photo | F.document | F.video)
 async def handle_message_in_conversation(message: Message, state: FSMContext, bot):
     user = await get_user(message.from_user.id)
@@ -65,10 +64,10 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
     data = await state.get_data()
     theme_name = data.get("theme_name", "Неизвестно")
 
-    # 1️⃣ Пересылаем ВСЕ сообщения в топик (диалог)
+    # 1️⃣ Пересылаем сообщение пользователя в топик
     await send_to_topic(bot, user, message, theme_name)
 
-    # 2️⃣ Получаем ответ от ИИ на КАЖДОЕ сообщение
+    # 2️⃣ Получаем ответ от ИИ
     history = [{"role": "user", "content": message.text or message.caption or ""}]
     ai_response = await ask_ai(
         user_message=message.text or message.caption or "",
@@ -77,22 +76,38 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         user_id=message.from_user.id
     )
 
-    # 3️⃣ Отправляем ответ ИИ пользователю
-    #    + уведомление о времени — ТОЛЬКО при first_message_in_ticket
-    response_texts = [ai_response["response_to_user"]]
+    # 3️⃣ Отправляем ответ ИИ в ТОТ ЖЕ ТОПИК
+    topic_id = await get_or_create_topic(
+        bot, user["user_id"], user["username"], user["full_name"], theme_name
+    )
+    await bot.send_message(
+        chat_id=SUPPORT_GROUP_ID,
+        message_thread_id=topic_id,
+        text=f"🤖 <b>ИИ:</b>\n{ai_response['response_to_user']}",
+        parse_mode="HTML"
+    )
+    if ai_response.get("need_more_info") and ai_response.get("additional_questions"):
+        await bot.send_message(
+            chat_id=SUPPORT_GROUP_ID,
+            message_thread_id=topic_id,
+            text=f"❓ <b>ИИ (уточнение):</b>\n{ai_response['additional_questions']}",
+            parse_mode="HTML"
+        )
 
+    # 4️⃣ Отправляем пользователю
+    response_parts = [ai_response["response_to_user"]]
+    
+    # Добавляем уточнение, если нужно
+    if ai_response.get("need_more_info") and ai_response.get("additional_questions"):
+        response_parts.append(ai_response["additional_questions"])
+    
+    # Добавляем уведомление о времени — ТОЛЬКО ПРИ ПЕРВОМ СООБЩЕНИИ В ЗАЯВКЕ
     if user.get("first_message_in_ticket") and ai_response.get("estimated_time"):
-        # Формируем уведомление один раз
-        est_time = ai_response["estimated_time"]
-        notice = await load_text("ticket_notice", time=est_time)
-        response_texts.insert(0, notice)
+        notice = await load_text("ticket_notice", time=ai_response["estimated_time"])
+        response_parts.insert(0, notice)
 
-    # Отправляем всё как единое сообщение
-    full_response = "\n\n".join(filter(None, response_texts))
-    await message.answer(full_response)
+    await message.answer("\n\n".join(filter(None, response_parts)))
 
-    # Сбрасываем флаг после первого сообщения
+    # 5️⃣ Сбрасываем флаг первого сообщения
     if user.get("first_message_in_ticket"):
         await update_user(message.from_user.id, first_message_in_ticket=0)
-
-    # Продолжаем в том же состоянии — никакого clear()
