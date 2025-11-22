@@ -47,7 +47,7 @@ async def theme_chosen(message: Message, state: FSMContext):
         await message.answer("Пожалуйста, выберите тему из меню.")
         return
 
-    # 🔑 СБРАСЫВАЕМ ФЛАГ — новая заявка!
+    # 🔑 Сбрасываем флаг — новая заявка
     await update_user(message.from_user.id, first_message_in_ticket=1, theme=theme_key)
 
     await state.update_data(theme=theme_key, theme_name=theme_text)
@@ -80,12 +80,14 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
     topic_id = await get_or_create_topic(
         bot, user["user_id"], user["username"], user["full_name"], theme_name
     )
+    # Основной ответ ИИ
     await bot.send_message(
         chat_id=SUPPORT_GROUP_ID,
         message_thread_id=topic_id,
         text=f"🤖 <b>ИИ:</b>\n{ai_response['response_to_user']}",
         parse_mode="HTML"
     )
+    # Доп. вопросы (если есть)
     if ai_response.get("need_more_info") and ai_response.get("additional_questions"):
         await bot.send_message(
             chat_id=SUPPORT_GROUP_ID,
@@ -94,19 +96,21 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
             parse_mode="HTML"
         )
 
-    # 4️⃣ Отправляем пользователю
-    response_parts = [ai_response["response_to_user"]]
-    
-    # Добавляем уточнение, если нужно
-    if ai_response.get("need_more_info") and ai_response.get("additional_questions"):
-        response_parts.append(ai_response["additional_questions"])
-    
-    # Добавляем уведомление о времени — ТОЛЬКО ПРИ ПЕРВОМ СООБЩЕНИИ В ЗАЯВКЕ
+    # 4️⃣ Формируем ответ ПОЛЬЗОВАТЕЛЮ (без дублирования!)
+    response_parts = []
+
+    # Уведомление о времени — ТОЛЬКО при первом сообщении в заявке
     if user.get("first_message_in_ticket") and ai_response.get("estimated_time"):
         notice = await load_text("ticket_notice", time=ai_response["estimated_time"])
-        response_parts.insert(0, notice)
+        response_parts.append(notice)
 
-    await message.answer("\n\n".join(filter(None, response_parts)))
+    # Основной текст: при need_more_info — используем ТОЛЬКО additional_questions
+    if ai_response.get("need_more_info") and ai_response.get("additional_questions"):
+        response_parts.append(ai_response["additional_questions"])
+    else:
+        response_parts.append(ai_response["response_to_user"])
+
+    await message.answer("\n".join(filter(None, response_parts)))
 
     # 5️⃣ Сбрасываем флаг первого сообщения
     if user.get("first_message_in_ticket"):
