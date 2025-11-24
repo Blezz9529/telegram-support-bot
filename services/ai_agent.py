@@ -80,6 +80,19 @@ def call_model(model, prompt: str):
 
 ########################################
 # 5. Main agent entrypoint
+# Backward‑compatible wrapper for old imports
+# Old code expects: from services.ai_agent import process_ticket
+
+def process_ticket(model, history, theme):
+    """
+    Backward-compatible adapter.
+    Old code used process_ticket; it now simply delegates to agent_reply.
+    """
+    result = agent_reply(model, history, theme)
+    # preserve old dict behavior
+    return result.dict() if hasattr(result, "dict") else result
+
+
 ########################################
 def agent_reply(model, history: List[Dict[str, str]], theme: str):
     prompt = build_prompt(history, theme)
