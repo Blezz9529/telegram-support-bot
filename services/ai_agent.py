@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # 1. Unified response schema
 ########################################
 class AgentResponse(BaseModel):
-    action: str = Field(..., regex="^(reply|collect_data|escalate)$")
+    action: str = Field(..., pattern="^(reply|collect_data|escalate)$")
     response_to_user: str
     detected_theme: Optional[str]
     data_collected: Dict[str, Any]
