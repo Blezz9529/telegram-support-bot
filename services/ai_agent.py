@@ -8,123 +8,102 @@ from typing import Dict, Any, List, Optional
 try:
     import google.generativeai as genai
     from google.generativeai.types import GenerationConfig
-    from google.api_core import exceptions as gapi_exceptions
     _GOOGLE_AVAILABLE = True
 except ImportError:
     _GOOGLE_AVAILABLE = False
-    logging.warning("Модуль google-generativeai не установлен. Fallback активирован.")
-
-from services.localization import load_text, load_ai_message
+    logging.warning("google-generativeai не установлен")
 
 logger = logging.getLogger(__name__)
+_gemini_model_cache = {}
 
-# Кэш моделей ПО ТЕМЕ (ускоряет повторные вызовы)
-_gemini_model_cache: Dict[str, "genai.GenerativeModel"] = {}
-
-
-# 🔑 ТЕМАТИЧЕСКИЕ ИНСТРУКЦИИ (с правилами need_human и кодовым словом)
-THEME_INSTRUCTIONS = {
-    "feedback": (
-        "Ты — агент сбора отзывов. "
-        "Задача: получить структурированный отзыв. "
-        "Правила need_human=true: "
-        "1. Упоминание 'угроза', 'суд', 'жалоба в регулятора' "
-        "2. Оценка ≤ 2/5 без пояснения "
-        "3. Требование 'немедленно связать с руководством'. "
-        "Всегда добавляй [[PUSH_OPERATOR]] в response_to_user, если need_human=true. "
-        "estimated_time: '12 часов' при need_human или need_more_info."
-    ),
-    "deposit": (
-        "Ты — эксперт по платежам. "
-        "Требуй: сумму, дату, способ оплаты, скриншот чека. "
-        "Правила need_human=true: "
-        "1. Упоминание 'мошенник', 'кинули', 'обман', 'полиция' "
-        "2. Сумма > 100000 руб. "
-        "3. Отсутствие скриншота при запросе 2+ раз. "
-        "Всегда добавляй [[PUSH_OPERATOR]] в response_to_user, если need_human=true. "
-        "estimated_time: '2 часа' при need_human, '12 часов' при need_more_info."
-    ),
-    "how_to_play": (
-        "Ты — гид по игре. "
-        "Отвечай только по официальной документации. "
-        "Правила need_human=true: "
-        "1. Вопрос про 'баг', 'ошибка', 'краш', 'не запускается' "
-        "2. Упоминание 'потерял аккаунт', 'взломали' "
-        "3. Запрос 'возврат средств за внутриигровые покупки'. "
-        "Всегда добавляй [[PUSH_OPERATOR]] в response_to_user, если need_human=true. "
-        "estimated_time: '12 часов'."
-    ),
-    "earn": (
-        "Ты — консультант по заработку. "
-        "Правила need_human=true: "
-        "1. Упоминание 'гарантия дохода', 'возврат вложений' "
-        "2. Сумма 'инвестиций' > 5000 руб. "
-        "3. Фразы 'как начать без вложений', 'гарантированно'. "
-        "Всегда добавляй [[PUSH_OPERATOR]] в response_to_user, если need_human=true. "
-        "estimated_time: '1 час' при need_human, '12 часов' при need_more_info."
-    ),
-    "partnership": (
-        "Ты — менеджер по партнёркам. "
-        "Правила need_human=true: ВСЕГДА (требуется ручное ТЗ). "
-        "Дополнительно: "
-        "- Запрашивай: тип партнёрки (CPL/CPA/CPS), охват, нишу, гео. "
-        "- Если нет данных по 2+ пунктам → need_more_info=true. "
-        "Всегда добавляй [[PUSH_OPERATOR]] в response_to_user. "
-        "estimated_time: '1 час'."
-    ),
-    "other": (
-        "Ты — ИИ-агент поддержки. "
-        "Правила need_human=true: "
-        "1. Упоминание 'ошибка', 'не работает', 'заблокировали', 'мошенник' "
-        "2. Эмоциональные фразы: 'возмущён', 'требую', 'жалоба' "
-        "3. Повторное обращение по одной теме (история > 2 сообщений). "
-        "Всегда добавляй [[PUSH_OPERATOR]] в response_to_user, если need_human=true. "
-        "estimated_time: '12 часов'."
-    )
+# 🔑 ЧЕК-ЛИСТЫ ПО ТЕМАМ (что обязательно нужно собрать)
+DATA_REQUIREMENTS = {
+    "deposit": [
+        {"key": "bank_screenshot", "desc": "Скрин счёта из банка", "required": True},
+        {"key": "bot_receipt", "desc": "Скрин реквизитов из бота", "required": True},
+        {"key": "payment_receipt", "desc": "Чек об оплате", "required": True},
+        {"key": "amount", "desc": "Сумма", "required": True},
+        {"key": "date", "desc": "Дата операции", "required": True}
+    ],
+    "partnership": [
+        {"key": "partner_type", "desc": "Тип партнёрки (CPL/CPA/CPS)", "required": True},
+        {"key": "traffic", "desc": "Охват/трафик", "required": True},
+        {"key": "niche", "desc": "Ниша", "required": True}
+    ],
+    "how_to_play": [
+        {"key": "error_details", "desc": "Описание ошибки", "required": False}
+    ]
 }
 
+# 🔑 ТРИГГЕРЫ ДЛЯ ЭСКАЛАЦИИ (общие + по темам)
+ESCALATION_TRIGGERS = {
+    "global": [
+        "угроз", "суд", "полиц", "жалоб", "регулятор", "мошенник", "кинули", "обман",
+        "возмущ", "требу", "немедленно", "руководств", "админ", "владелец"
+    ],
+    "deposit": ["сумма > 100000", "отсутствие скриншотов после 2 запросов"]
+}
 
-def _get_gemini_model(theme: str = "other") -> Optional["genai.GenerativeModel"]:
-    """Ленивая инициализация модели ПО ТЕМЕ"""
+def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     if not _GOOGLE_AVAILABLE:
         return None
-
-    # Нормализуем тему
-    theme = theme if theme in THEME_INSTRUCTIONS else "other"
-
-    if theme not in _gemini_model_cache:
+    if "main" not in _gemini_model_cache:
         api_key = os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")
         if not api_key:
-            logger.warning("GEMINI_API_KEY не задан — Gemini отключён")
             return None
-
         try:
             genai.configure(api_key=api_key)
-            system_instr = THEME_INSTRUCTIONS[theme]
-            
-            _gemini_model_cache[theme] = genai.GenerativeModel(
-                model_name="gemini-2.0-flash",
+            _gemini_model_cache["main"] = genai.GenerativeModel(
+                model_name="gemini-1.5-flash-002",
                 generation_config=GenerationConfig(
-                    temperature=0.2,
+                    temperature=0.1,  # ↓ для точности
                     top_p=0.95,
-                    top_k=40,
-                    max_output_tokens=512,
+                    max_output_tokens=768,
                     response_mime_type="application/json"
                 ),
-                system_instruction=system_instr
+                system_instruction=(
+                    "Ты — ИИ-агент техподдержки. Твоя задача — управлять заявкой до завершения.\n"
+                    "ИНСТРУКЦИЯ:\n"
+                    "1. Определи ТЕКУЩУЮ тему (если не задана).\n"
+                    "2. Проверь историю: какие данные уже собраны?\n"
+                    "3. Сравни с ЧЕК-ЛИСТОМ для темы.\n"
+                    "4. Примени ТРИГГЕРЫ ЭСКАЛАЦИИ.\n"
+                    "5. Верни ТОЛЬКО JSON по схеме ниже.\n\n"
+                    
+                    "СХЕМА ОТВЕТА:\n"
+                    "{\n"
+                    '  "action": "reply" | "collect_data" | "escalate",\n'
+                    '  "response_to_user": "Текст для отправки (без технических пометок)",\n'
+                    '  "data_collected": {"bank_screenshot": true, "amount": "5000", ...},\n'
+                    '  "missing_data": ["Скрин счёта", "Чек"],\n'
+                    '  "escalation_reason": "Причина эскалации или null",\n'
+                    '  "estimated_time": "12 часов" | "2 часа" | "1 час"\n'
+                    "}\n\n"
+                    
+                    "ЧЕК-ЛИСТЫ:\n"
+                    "- deposit: скрин счёта, скрин реквизитов, чек, сумма, дата\n"
+                    "- partnership: тип, охват, ниша\n"
+                    "- how_to_play: описание ошибки (не обязательно)\n\n"
+                    
+                    "ТРИГГЕРЫ ЭСКАЛАЦИИ:\n"
+                    "- Угрозы, суд, мошенничество → escalate\n"
+                    "- Для deposit: сумма > 100000 руб, нет скринов после 2 запросов → escalate\n"
+                    "- Партнёрка → всегда collect_data, затем escalate\n\n"
+                    
+                    "ВАЖНО:\n"
+                    "- Не выдумывай данные. Если пользователь не прислал скрин — bank_screenshot=false.\n"
+                    "- estimated_time: deposit=2ч, partnership=1ч, остальное=12ч при escalate/collect_data.\n"
+                    "- При action=reply — estimated_time=\"\"."
+                )
             )
-            # Проверка
-            _gemini_model_cache[theme].generate_content("OK", generation_config={"max_output_tokens": 1})
-            logger.info(f"✅ Модель для темы '{theme}' инициализирована")
         except Exception as e:
-            logger.error(f"Ошибка инициализации модели '{theme}': {e}")
+            logger.error(f"Ошибка инициализации модели: {e}")
             return None
-    return _gemini_model_cache[theme]
+    return _gemini_model_cache["main"]
 
 
-async def _call_gemini(prompt: str, theme: str) -> Optional[Dict[str, Any]]:
-    """Вызов Gemini с тематической моделью"""
-    model = _get_gemini_model(theme)
+async def _call_gemini(prompt: str) -> Optional[Dict[str, Any]]:
+    model = _get_gemini_model()
     if not model:
         return None
 
@@ -132,145 +111,100 @@ async def _call_gemini(prompt: str, theme: str) -> Optional[Dict[str, Any]]:
         loop = asyncio.get_event_loop()
         response = await asyncio.wait_for(
             loop.run_in_executor(None, lambda: model.generate_content([prompt])),
-            timeout=20.0
+            timeout=25.0
         )
 
         if not response or not response.text:
-            logger.warning("Gemini: пустой ответ")
             return None
 
-        parsed = json.loads(response.text.strip())
-        required = {"response_to_user", "need_human", "need_more_info"}
-        if not required.issubset(parsed.keys()):
-            logger.warning(f"Gemini: неполный JSON: {parsed}")
+        result = json.loads(response.text.strip())
+        required = {"action", "response_to_user", "data_collected", "missing_data", "escalation_reason", "estimated_time"}
+        if not required.issubset(result.keys()):
+            logger.warning(f"Неполный JSON: {result}")
             return None
-        return parsed
+        return result
 
-    except asyncio.TimeoutError:
-        logger.warning("Gemini: таймаут 20с")
-        return None
-    except json.JSONDecodeError as e:
-        logger.error(f"Gemini: невалидный JSON: {e} | Ответ: {getattr(response, 'text', 'N/A')}")
-        return None
     except Exception as e:
-        if _GOOGLE_AVAILABLE:
-            if "429" in str(e):
-                logger.warning("Gemini: лимит RPM/TPM исчерпан")
-            elif "API_KEY_INVALID" in str(e):
-                logger.critical(f"Gemini: неверный API-ключ: {e}")
-            else:
-                logger.exception(f"Gemini: ошибка: {e}")
+        logger.exception("Ошибка Gemini")
         return None
 
 
-async def ask_ai(user_message: str, history: List[Dict[str, str]], theme: str, user_id: int) -> Dict[str, Any]:
+async def process_ticket(
+    user_message: str,
+    history: List[Dict[str, Any]],
+    current_theme: Optional[str],
+    user_id: int
+) -> Dict[str, Any]:
     """
-    Основная функция ИИ-агента.
-    Возвращает dict с полями:
-      - response_to_user: str (может содержать [[PUSH_OPERATOR]])
-      - need_human: bool
-      - need_more_info: bool
-      - additional_questions: str
-      - estimated_time: str
+    Единая точка обработки заявки.
+    Возвращает структурированный ответ с чёткими инструкциями.
     """
-    # Нормализуем тему для инструкции
-    theme_for_instr = theme if theme in THEME_INSTRUCTIONS else "other"
-    
-    prompt = f"""[КОНТЕКСТ]
-Тема: {theme}
-USER_ID: {user_id}
-История (последние 3): {history[-3:]}
+    # Формируем историю для ИИ (макс. 5 последних сообщений)
+    history_preview = []
+    for msg in history[-5:]:
+        role = "Пользователь" if msg["from_user"] else "Бот"
+        text = msg["text"] or "[Медиа]"
+        history_preview.append(f"{role}: {text}")
 
-[СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ]
+    prompt = f"""[КОНТЕКСТ]
+USER_ID: {user_id}
+Текущая тема: {current_theme or 'не определена'}
+Чек-лист для темы: {DATA_REQUIREMENTS.get(current_theme, [])}
+
+[ИСТОРИЯ]
+{chr(10).join(history_preview)}
+
+[НОВОЕ СООБЩЕНИЕ]
 {user_message}
 
-[ТРЕБОВАНИЯ]
-1. Ответ — ТОЛЬКО валидный JSON.
-2. Если need_human=true — ДОБАВЬ [[PUSH_OPERATOR]] в response_to_user.
-3. estimated_time:
-   - deposit + need_human → "2 часа"
-   - earn/partnership + need_human → "1 час"
-   - иначе → "12 часов" (при need_human или need_more_info)
-4. Схема:
-{{
-  "response_to_user": "строка",
-  "need_human": булево,
-  "need_more_info": булево,
-  "additional_questions": "строка",
-  "estimated_time": "строка"
-}}"""
+[ЗАДАЧА]
+1. Если тема не определена — определи её по сообщению.
+2. Проанализируй историю: какие данные уже собраны?
+3. Сравни с чек-листом.
+4. Проверь триггеры эскалации.
+5. Верни JSON по схеме."""
 
     try:
-        gemini_result = await _call_gemini(prompt, theme_for_instr)
-        if gemini_result:
-            # Обеспечиваем наличие estimated_time
-            if gemini_result.get("need_human") or gemini_result.get("need_more_info"):
-                if theme == "deposit" and gemini_result["need_human"]:
-                    gemini_result["estimated_time"] = "2 часа"
-                elif theme in ["earn", "partnership"] and gemini_result["need_human"]:
-                    gemini_result["estimated_time"] = "1 час"
-                else:
-                    gemini_result["estimated_time"] = "12 часов"
-            else:
-                gemini_result.setdefault("estimated_time", "")
-            logger.info(f"Gemini OK для user_id={user_id}, theme={theme}")
-            return gemini_result
+        result = await _call_gemini(prompt)
+        if result:
+            logger.info(f"✅ ИИ обработал заявку user_id={user_id}, action={result['action']}")
+            return result
     except Exception as e:
-        logger.exception(f"Gemini error → fallback: {e}")
+        logger.exception("Fallback на базовую логику")
 
-    # === FALLBACK (гарантированно совместим с правилами выше) ===
+    # === БАЗОВЫЙ FALLBACK (гарантированно работает) ===
     text = (user_message or "").lower()
-    low_words = ["спасибо", "ок", "понял", "ясно", "ладно"]
-    high_words = ["ошибка", "не работает", "заблокировали", "мошенник", "кинули", "угроза", "суд"]
-    deposit_words = ["деньги", "платеж", "транзакция", "счёт", "баланс"]
-    partner_words = ["партнёр", "сотрудничество", "партнёрка", "партнер"]
-
-    need_human = False
-    estimated_time = "12 часов"
-
-    # Правила need_human по темам
-    if theme == "deposit" and any(w in text for w in ["мошенник", "кинули", "полиция"]):
-        need_human = True
-        estimated_time = "2 часа"
-    elif theme == "partnership":
-        need_human = True
-        estimated_time = "1 час"
-    elif any(w in text for w in high_words):
-        need_human = True
-
-    if any(w in text for w in low_words):
+    escalation_keywords = ESCALATION_TRIGGERS["global"]
+    
+    if any(kw in text for kw in escalation_keywords):
         return {
-            "response_to_user": "Спасибо за обращение!",
-            "need_human": False,
-            "need_more_info": False,
-            "additional_questions": "",
-            "estimated_time": ""
+            "action": "escalate",
+            "response_to_user": "Ваш запрос требует особого внимания — передан оператору.",
+            "data_collected": {},
+            "missing_data": [],
+            "escalation_reason": "Обнаружены триггеры эскалации",
+            "estimated_time": "12 часов"
         }
 
-    if need_human:
-        push_tag = " [[PUSH_OPERATOR]]" if theme != "partnership" else " [[PUSH_OPERATOR]]"
-        return {
-            "response_to_user": f"Ваш запрос передан оператору.{push_tag}",
-            "need_human": True,
-            "need_more_info": False,
-            "additional_questions": "",
-            "estimated_time": estimated_time
-        }
-
-    # Запрос доп. информации
-    if theme == "deposit":
-        questions = "Укажите: 1) Сумму платежа, 2) Дату, 3) Способ оплаты, 4) Пришлите скриншот чека."
-        estimated_time = "12 часов"
-    elif theme == "partnership":
-        questions = "Опишите: тип партнёрки (CPL/CPA), ваш охват, нишу и гео."
-        estimated_time = "1 час"
-    else:
-        questions = "Пожалуйста, уточните детали вашего вопроса."
+    if current_theme == "deposit":
+        # Проверяем наличие ключевых данных
+        has_screenshots = "скрин" in text or "screenshot" in text
+        has_amount = any(x in text for x in ["руб", "rur", "usd", "сумм"])
+        if not (has_screenshots and has_amount):
+            return {
+                "action": "collect_data",
+                "response_to_user": "Чтобы проверить платёж, нам нужны:\n1. Скрин счёта из банка\n2. Скрин реквизитов из бота\n3. Чек об оплате",
+                "data_collected": {"has_screenshots": has_screenshots, "has_amount": has_amount},
+                "missing_data": ["Скрин счёта", "Чек"] if not has_screenshots else [],
+                "escalation_reason": None,
+                "estimated_time": "2 часа"
+            }
 
     return {
-        "response_to_user": "Чтобы помочь, нам нужно больше информации:",
-        "need_human": False,
-        "need_more_info": True,
-        "additional_questions": questions,
-        "estimated_time": estimated_time
+        "action": "reply",
+        "response_to_user": "Спасибо за информацию! Оператор свяжется при необходимости.",
+        "data_collected": {},
+        "missing_data": [],
+        "escalation_reason": None,
+        "estimated_time": ""
     }
