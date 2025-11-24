@@ -15,11 +15,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ✅ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: настройка сессии с таймаутами
+# ✅ ПРАВИЛЬНАЯ НАСТРОЙКА СЕССИИ ДЛЯ aiohttp + aiogram ≥3.13
+import aiohttp
 session = AiohttpSession(
-    timeout=30.0,  # общий таймаут
-    connection_timeout=10.0,  # таймаут подключения
-    request_timeout=30.0     # таймаут запроса
+    # Единый таймаут для всех операций
+    timeout=aiohttp.ClientTimeout(
+        total=30.0,      # общий лимит на запрос
+        connect=10.0,    # таймаут подключения
+        sock_read=20.0,  # таймаут чтения
+        sock_connect=10.0  # таймаут установки соединения
+    )
 )
 
 bot = Bot(
@@ -30,7 +35,6 @@ bot = Bot(
     )
 )
 dp = Dispatcher()
-
 
 # Импорт хэндлеров
 try:
@@ -43,40 +47,31 @@ except ImportError as e:
 
 
 async def on_startup():
-    """Инициализация при запуске"""
     logger.info("🚀 Инициализация бота...")
-    
-    # Инициализация БД
     try:
         from storages.db import init_db
         await init_db()
         logger.info("✅ База данных готова")
-    except Exception as e:
-        logger.critical(f"❌ Ошибка БД: {e}")
-        sys.exit(1)
-    
-    # Проверка доступа к форуму
-    try:
+        
         chat = await bot.get_chat(SUPPORT_GROUP_ID)
-        logger.info(f"✅ Форум подключён: {chat.title}")
+        logger.info(f"✅ Форум: {chat.title}")
     except Exception as e:
-        logger.error(f"❌ Ошибка подключения к форуму: {e}")
+        logger.critical(f"❌ Ошибка: {e}")
         sys.exit(1)
 
 
 async def main():
     await on_startup()
-    logger.info("📡 Бот запущен и ожидает сообщений...")
+    logger.info("📡 Бот запущен...")
     try:
         await dp.start_polling(
             bot,
-            allowed_updates=["message", "callback_query", "chat_member"],
-            close_bot_session=True
+            allowed_updates=["message", "callback_query"]
         )
     except KeyboardInterrupt:
-        logger.info("🛑 Получен сигнал завершения")
+        logger.info("🛑 Остановка")
     except Exception as e:
-        logger.exception(f"💥 Критическая ошибка: {e}")
+        logger.exception(f"💥 Ошибка: {e}")
         sys.exit(1)
 
 
@@ -85,6 +80,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except RuntimeError as e:
         if "event loop is closed" in str(e):
-            pass  # Игнорируем для Windows
+            pass
         else:
             raise
