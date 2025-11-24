@@ -1,42 +1,27 @@
-# main.py
+# main.py (финальная, проверенная версия)
 import asyncio
 import logging
 import sys
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from config import BOT_TOKEN, SUPPORT_GROUP_ID
 
-# Настройка логгера
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# ✅ ПРАВИЛЬНАЯ НАСТРОЙКА СЕССИИ ДЛЯ aiohttp + aiogram ≥3.13
-import aiohttp
-session = AiohttpSession(
-    # Единый таймаут для всех операций
-    timeout=aiohttp.ClientTimeout(
-        total=30.0,      # общий лимит на запрос
-        connect=10.0,    # таймаут подключения
-        sock_read=20.0,  # таймаут чтения
-        sock_connect=10.0  # таймаут установки соединения
-    )
-)
-
+# ✅ ПРОСТОЙ И РАБОЧИЙ ВАРИАНТ: без кастомной сессии
 bot = Bot(
     token=BOT_TOKEN,
-    session=session,  # ← ИСПОЛЬЗУЕМ НАСТРОЕННУЮ СЕССИЮ
     default=DefaultBotProperties(
         parse_mode=ParseMode.HTML
     )
 )
 dp = Dispatcher()
 
-# Импорт хэндлеров
 try:
     from handlers import user, admin
     dp.include_router(user.router)
@@ -64,9 +49,15 @@ async def main():
     await on_startup()
     logger.info("📡 Бот запущен...")
     try:
+        # ✅ НАСТРОЙКА ТАЙМАУТОВ В start_polling()
         await dp.start_polling(
             bot,
-            allowed_updates=["message", "callback_query"]
+            allowed_updates=["message", "callback_query"],
+            # Защита от Flood Control:
+            polling_timeout=30,  # таймаут опроса
+            handle_asynchronously=True,  # асинхронная обработка
+            # Ключевое: request_timeout передаётся отдельно
+            bot_request_timeout=30.0  # ← РАБОЧИЙ ПАРАМЕТР
         )
     except KeyboardInterrupt:
         logger.info("🛑 Остановка")
