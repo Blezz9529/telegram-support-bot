@@ -3,7 +3,7 @@ from aiogram import Router, F
 from aiogram.types import Message
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from config import SUPPORT_GROUP_ID
+from config import SUPPORT_GROUP_ID, ADMINS
 from storages.db import get_user, create_user, update_user
 from services.localization import load_text, load_button
 from services.ai_agent import ask_ai
@@ -47,7 +47,7 @@ async def theme_chosen(message: Message, state: FSMContext):
         await message.answer("Пожалуйста, выберите тему из меню.")
         return
 
-    # 🔑 Сбрасываем флаг — новая заявка
+    # Сбрасываем флаг новой заявки
     await update_user(message.from_user.id, first_message_in_ticket=1, theme=theme_key)
 
     await state.update_data(theme=theme_key, theme_name=theme_text)
@@ -76,18 +76,37 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         user_id=message.from_user.id
     )
 
-    # 3️⃣ Отправляем ответ ИИ в ТОТ ЖЕ ТОПИК
+    # 3️⃣ Обработка кодового слова [[PUSH_OPERATOR]]
+    need_push_operator = "[[PUSH_OPERATOR]]" in ai_response["response_to_user"]
+    if need_push_operator:
+        # Удаляем кодовое слово из ответа пользователю
+        ai_response["response_to_user"] = (
+            ai_response["response_to_user"]
+            .replace("[[PUSH_OPERATOR]]", "")
+            .strip()
+        )
+        # Отправляем уведомление операторам в топик
+        topic_id = await get_or_create_topic(
+            bot, user["user_id"], user["username"], user["full_name"], theme_name
+        )
+        admin_tags = " ".join([f"<a href='tg://user?id={a}'>🔔</a>" for a in ADMINS])
+        await bot.send_message(
+            chat_id=SUPPORT_GROUP_ID,
+            message_thread_id=topic_id,
+            text=f"{admin_tags} <b>❗ Требуется внимание оператора!</b>",
+            parse_mode="HTML"
+        )
+
+    # 4️⃣ Отправляем ответ ИИ в ТОТ ЖЕ ТОПИК (для лога)
     topic_id = await get_or_create_topic(
         bot, user["user_id"], user["username"], user["full_name"], theme_name
     )
-    # Основной ответ ИИ
     await bot.send_message(
         chat_id=SUPPORT_GROUP_ID,
         message_thread_id=topic_id,
         text=f"🤖 <b>ИИ:</b>\n{ai_response['response_to_user']}",
         parse_mode="HTML"
     )
-    # Доп. вопросы (если есть)
     if ai_response.get("need_more_info") and ai_response.get("additional_questions"):
         await bot.send_message(
             chat_id=SUPPORT_GROUP_ID,
@@ -96,7 +115,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
             parse_mode="HTML"
         )
 
-    # 4️⃣ Формируем ответ ПОЛЬЗОВАТЕЛЮ (без дублирования!)
+    # 5️⃣ Формируем ответ ПОЛЬЗОВАТЕЛЮ (без дублирования!)
     response_parts = []
 
     # Уведомление о времени — ТОЛЬКО при первом сообщении в заявке
@@ -112,6 +131,6 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
 
     await message.answer("\n".join(filter(None, response_parts)))
 
-    # 5️⃣ Сбрасываем флаг первого сообщения
+    # 6️⃣ Сбрасываем флаг первого сообщения
     if user.get("first_message_in_ticket"):
         await update_user(message.from_user.id, first_message_in_ticket=0)
