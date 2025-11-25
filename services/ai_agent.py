@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, ValidationError
 import asyncio
 
-# === Опциональные импорты Google AI ===
 try:
     import google.generativeai as genai
     from google.generativeai.types import GenerationConfig
@@ -128,7 +127,7 @@ USER_ID: {user_id}
     if ENABLE_MEDIA_ANALYSIS and has_media:
         base_prompt += (
             "\n\nПользователь отправил медиа. Проанализируй его и ответь, соответствует ли оно теме. "
-            "Если это скриншот, определи, содержит ли он: реквизиты, сумму, дату, логотип бота. "
+            "Если это скриншот — определи, содержит ли он: реквизиты, сумму, дату, логотип бота. "
             "Если это документ — укажи, что на нём написано. "
             "Не выдумывай данные — если не видишь — пиши 'не удалось распознать'."
         )
@@ -136,14 +135,14 @@ USER_ID: {user_id}
     return base_prompt
 
 
-# === 5. Вызов модели с ЛОГИРОВАНИЕМ ===
+# === 5. Вызов модели с ЛОГИРОВАНИЕМ (без ограничения длины) ===
 async def _call_gemini(prompt: str) -> Optional[AgentResponse]:
     model = _get_gemini_model()
     if not model:
         return None
 
-    prompt_preview = prompt[:300].replace("\n", " ").strip()
-    logger.info(f"📤 Gemini: промпт (длина={len(prompt)}): '{prompt_preview}...'")
+    # 🔑 ЛОГИРУЕМ ВХОД БЕЗ ОБРЕЗКИ
+    logger.info(f"📤 Gemini: промпт (длина={len(prompt)}):\n{prompt}")
 
     try:
         response = await asyncio.to_thread(model.generate_content, [prompt])
@@ -151,8 +150,8 @@ async def _call_gemini(prompt: str) -> Optional[AgentResponse]:
             logger.warning("❌ Gemini: пустой ответ")
             return None
 
-        response_preview = response.text[:200].replace("\n", " ").strip()
-        logger.info(f"📥 Gemini: ответ (длина={len(response.text)}): '{response_preview}...'")
+        # 🔑 ЛОГИРУЕМ ВЫХОД БЕЗ ОБРЕЗКИ
+        logger.info(f"📥 Gemini: ответ (длина={len(response.text)}):\n{response.text}")
 
         parsed = json.loads(response.text.strip())
         validated = AgentResponse.model_validate(parsed)
@@ -169,7 +168,7 @@ async def _call_gemini(prompt: str) -> Optional[AgentResponse]:
     return None
 
 
-# === 6. Fallback-логика ===
+# === 6. Fallback-логика — упрощённая ===
 def _fallback_response(user_message: str, theme: str) -> AgentResponse:
     text = (user_message or "").lower()
     rules = THEME_RULES.get(theme, THEME_RULES["default"])

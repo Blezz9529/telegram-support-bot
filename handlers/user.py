@@ -38,9 +38,11 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer(await load_text("blocked"))
         return
 
+    # Сбрасываем FSM
     await state.set_data({"conversation_history": []})
     await state.set_state(SupportStates.choosing_theme)
 
+    # Отправляем меню
     await message.answer(
         await load_text("start_message"),
         reply_markup=await get_main_menu()
@@ -55,7 +57,7 @@ async def theme_chosen(message: Message, state: FSMContext):
         await message.answer("Пожалуйста, выберите тему из меню.")
         return
 
-    # Сбрасываем флаг новой заявки
+    # Сбрасываем флаг новой заявки и сохраняем тему
     await update_user(message.from_user.id, first_message_in_ticket=1, theme=theme_key)
     await state.update_data({
         "theme": theme_key,
@@ -73,12 +75,13 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         await message.answer(await load_text("blocked"))
         return
 
+    # Получаем данные из FSM
     data = await state.get_data()
     current_theme = data.get("theme")
     theme_name = data.get("theme_name", "Неизвестно")
     history = data.get("conversation_history", [])
 
-    # 🔑 Добавляем сообщение в историю (включая медиа-флаг)
+    # 🔑 Формируем запись сообщения (важно: has_media=True для медиа)
     new_msg = {
         "from_user": True,
         "text": message.text or message.caption or "[Медиа]",
@@ -90,7 +93,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         history = history[-10:]
     await state.update_data(conversation_history=history)
 
-    # 🔑 ВЫЗОВ ИИ (асинхронный)
+    # 🔑 ВЫЗОВ ИИ (асинхронный!)
     try:
         ai_result = await process_ticket(
             user_message=new_msg["text"],
@@ -99,7 +102,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
             user_id=message.from_user.id
         )
     except Exception as e:
-        logger.exception("❌ Ошибка в process_ticket")
+        logger.exception("❌ Ошибка в process_ticket — используем fallback")
         ai_result = {
             "action": "escalate",
             "response_to_user": "Извините, произошла ошибка. Запрос передан оператору.",
@@ -167,7 +170,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
             parse_mode="HTML"
         )
 
-    # Формируем ответ пользователю
+    # ✅ Формируем ответ пользователю
     response_parts = []
     # Уведомление о времени — ТОЛЬКО при первом сообщении в заявке
     if user.get("first_message_in_ticket") and ai_result.get("estimated_time"):
