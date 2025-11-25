@@ -17,6 +17,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# ✅ МОДУЛЬНЫЙ ФЛАГ: включите анализ медиа здесь
+ENABLE_MEDIA_ANALYSIS = True  # ← Поставьте False, чтобы отключить анализ файлов
 
 # === 1. Схема ответа (Pydantic 2.11+) ===
 class AgentResponse(BaseModel):
@@ -32,11 +34,11 @@ class AgentResponse(BaseModel):
 # === 2. Тематические правила ===
 THEME_RULES = {
     "deposit": {
-        "required_data": ["bank_screenshot", "bot_receipt", "payment_receipt"],
+        "required_data": ["payment_proof"],
         "escalation_conditions": ["угроз", "суд", "полиц", "жалоб", "мошенник", "кинули", "обман"]
     },
     "partnership": {
-        "required_data": ["partner_type", "traffic", "niche"],
+        "required_data": ["proposal"],
         "escalation_conditions": []
     },
     "default": {
@@ -52,7 +54,6 @@ _gemini_model = None
 def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     global _gemini_model
     if not _GOOGLE_AVAILABLE:
-        logger.warning("❌ Gemini: google-generativeai не импортирован")
         return None
 
     if _gemini_model is None:
@@ -64,7 +65,7 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
         try:
             genai.configure(api_key=api_key)
             _gemini_model = genai.GenerativeModel(
-                model_name="gemini-2.0-flash",  # ← ТОЧНО КАК ЗАПРОШЕНО
+                model_name="gemini-2.0-flash",
                 generation_config=GenerationConfig(
                     temperature=0.1,
                     top_p=0.95,
@@ -81,20 +82,21 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     return _gemini_model
 
 
-# === 4. Построение промпта ===
+# === 4. Построение промпта — с учётом медиа ===
 def _build_prompt(
     user_message: str,
     history: List[Dict[str, Any]],
     theme: str,
-    user_id: int
+    user_id: int,
+    has_media: bool = False
 ) -> str:
     rules = THEME_RULES.get(theme, THEME_RULES["default"])
     history_preview = "\n".join([
         f"{'👤' if h.get('from_user') else '🤖'}: {h.get('text', '')}"
         for h in history[-5:]
     ])
-    
-    return f"""[КОНТЕКСТ]
+
+    base_prompt = f"""[КОНТЕКСТ]
 USER_ID: {user_id}
 Тема: {theme}
 Требуемые данные: {rules['required_data']}
@@ -102,8 +104,8 @@ USER_ID: {user_id}
 
 [ИНСТРУКЦИЯ]
 1. Если есть триггеры → action="escalate"
-2. Если не хватает данных → action="collect_data"
-3. Иначе → action="reply"
+2. Если пользователь отправил фото/документ → action="reply" (анализируй содержимое)
+3. Если нет данных по required_data → action="collect_data" с общей фразой: "Пожалуйста, пришлите любые документы, подтверждающие ваш запрос"
 4. estimated_time: "2 ч" для deposit, "1 ч" для partnership, "12 ч" иначе
 
 [ФОРМАТ ОТВЕТА СТРОГО JSON]
@@ -123,6 +125,16 @@ USER_ID: {user_id}
 [НОВОЕ СООБЩЕНИЕ]
 {user_message}"""
 
+    if ENABLE_MEDIA_ANALYSIS and has_media:
+        base_prompt += (
+            "\n\nПользователь отправил медиа. Проанализируй его и ответь, соответствует ли оно теме. "
+            "Если это скриншот, определи, содержит ли он: реквизиты, сумму, дату, логотип бота. "
+            "Если это документ — укажи, что на нём написано. "
+            "Не выдумывай данные — если не видишь — пиши 'не удалось распознать'."
+        )
+
+    return base_prompt
+
 
 # === 5. Вызов модели с ЛОГИРОВАНИЕМ ===
 async def _call_gemini(prompt: str) -> Optional[AgentResponse]:
@@ -130,22 +142,18 @@ async def _call_gemini(prompt: str) -> Optional[AgentResponse]:
     if not model:
         return None
 
-    # 🔑 ЛОГИРУЕМ ВХОД
     prompt_preview = prompt[:300].replace("\n", " ").strip()
     logger.info(f"📤 Gemini: промпт (длина={len(prompt)}): '{prompt_preview}...'")
 
     try:
-        # Асинхронный вызов
         response = await asyncio.to_thread(model.generate_content, [prompt])
         if not response or not response.text:
             logger.warning("❌ Gemini: пустой ответ")
             return None
 
-        # 🔑 ЛОГИРУЕМ ВЫХОД
         response_preview = response.text[:200].replace("\n", " ").strip()
         logger.info(f"📥 Gemini: ответ (длина={len(response.text)}): '{response_preview}...'")
 
-        # Валидация
         parsed = json.loads(response.text.strip())
         validated = AgentResponse.model_validate(parsed)
         logger.info(f"✅ Gemini: валидный ответ → action='{validated.action}', theme='{validated.detected_theme}'")
@@ -178,8 +186,8 @@ def _fallback_response(user_message: str, theme: str) -> AgentResponse:
     if theme == "deposit":
         return AgentResponse(
             action="collect_data",
-            response_to_user="Пожалуйста, пришлите скриншоты:\n1. Счёт из банка\n2. Реквизиты из бота\n3. Чек об оплате",
-            missing_data=["Скрин счёта", "Скрин реквизитов", "Чек"],
+            response_to_user="Пожалуйста, пришлите любые документы, подтверждающие ваш запрос (например, скриншоты, чеки, переписку).",
+            missing_data=["Любые доказательства"],
             estimated_time="2 часа"
         )
 
@@ -190,7 +198,7 @@ def _fallback_response(user_message: str, theme: str) -> AgentResponse:
     )
 
 
-# === 7. ОСНОВНОЙ ВХОД (асинхронный, с логами) ===
+# === 7. ОСНОВНОЙ ВХОД (асинхронный) ===
 async def process_ticket(
     *,
     user_message: str,
@@ -203,16 +211,21 @@ async def process_ticket(
         ai_result = await process_ticket(user_message=..., history=..., ...)
     """
     logger.info(f"🆕 Запрос ИИ: user_id={user_id}, тема={current_theme or 'default'}, сообщение='{user_message[:50]}...'")
-    
-    theme = current_theme or "default"
-    prompt = _build_prompt(user_message, history, theme, user_id)
 
-    # Вызов ИИ
+    theme = current_theme or "default"
+
+    # 🔍 Определяем, есть ли медиа в истории
+    has_media = any(h.get("has_media") for h in history)
+
+    # 🔑 Построение промпта
+    prompt = _build_prompt(user_message, history, theme, user_id, has_media)
+
+    # 🔑 Вызов ИИ
     ai_result = await _call_gemini(prompt)
     if ai_result:
         return ai_result.model_dump()
 
-    # Fallback
+    # ❗ Fallback
     logger.warning("⚠️ Используется fallback-логика")
     fallback = _fallback_response(user_message, theme)
     return fallback.model_dump()
