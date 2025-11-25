@@ -1,17 +1,18 @@
 # handlers/user.py
-from aiogram import Router, F
+from aiogram import Router, F, Bot
 from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from config import SUPPORT_GROUP_ID, ADMINS
 from storages.db import get_user, create_user, update_user
-from services.localization import load_text, load_button
-from services.ai_agent import process_ticket
+from services.localization import load_text
+from services.ai_agent import process_ticket  # ← async def
 from services.forum import send_to_topic, get_or_create_topic
-from keyboards.reply import get_main_menu  # ✅ КОРРЕКТНЫЙ ИМПОРТ
+from keyboards.reply import get_main_menu
+import logging
 
 router = Router()
-logger = __import__('logging').getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class SupportStates(StatesGroup):
@@ -37,14 +38,14 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer(await load_text("blocked"))
         return
 
-    # Сбрасываем историю и состояние
+    # Сбрасываем FSM
     await state.set_data({"conversation_history": []})
     await state.set_state(SupportStates.choosing_theme)
 
-    # ✅ ПРАВИЛЬНО: вызов асинхронной клавиатуры
+    # Отправляем меню
     await message.answer(
         await load_text("start_message"),
-        reply_markup=await get_main_menu()  # ← НЕ список, а ReplyKeyboardMarkup
+        reply_markup=await get_main_menu()
     )
 
 
@@ -68,19 +69,19 @@ async def theme_chosen(message: Message, state: FSMContext):
 
 
 @router.message(SupportStates.in_conversation, F.text | F.photo | F.document | F.video)
-async def handle_message_in_conversation(message: Message, state: FSMContext, bot):
+async def handle_message_in_conversation(message: Message, state: FSMContext, bot: Bot):
     user = await get_user(message.from_user.id)
     if not user or user["is_blocked"]:
         await message.answer(await load_text("blocked"))
         return
 
-    # Загружаем данные из FSM
+    # Получаем данные из FSM
     data = await state.get_data()
     current_theme = data.get("theme")
     theme_name = data.get("theme_name", "Неизвестно")
     history = data.get("conversation_history", [])
 
-    # Добавляем новое сообщение в историю
+    # Формируем запись сообщения
     new_msg = {
         "from_user": True,
         "text": message.text or message.caption or "[Медиа]",
@@ -92,13 +93,25 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         history = history[-10:]
     await state.update_data(conversation_history=history)
 
-    # 🔑 Вызов ИИ с полной историей
-    ai_result = await process_ticket(
-        user_message=new_msg["text"],
-        history=history,
-        current_theme=current_theme,
-        user_id=message.from_user.id
-    )
+    # 🔑 ВЫЗОВ ИИ (асинхронный!)
+    try:
+        ai_result = await process_ticket(
+            user_message=new_msg["text"],
+            history=history,
+            current_theme=current_theme,
+            user_id=message.from_user.id
+        )
+    except Exception as e:
+        logger.exception("❌ Ошибка в process_ticket")
+        ai_result = {
+            "action": "escalate",
+            "response_to_user": "Извините, произошла ошибка. Запрос передан оператору.",
+            "detected_theme": current_theme,
+            "data_collected": {},
+            "missing_data": [],
+            "escalation_reason": "internal_error",
+            "estimated_time": "12 часов"
+        }
 
     # Обновление темы, если определена ИИ
     detected_theme = ai_result.get("detected_theme")
@@ -116,15 +129,15 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
     # Пересылаем сообщение в топик
     await send_to_topic(bot, user, message, theme_name)
 
-    # Анализ ИИ в топик
+    # Отправляем анализ ИИ в топик
     analysis_blocks = [
-        f"🧠 <b>ИИ (gemini-2.0-flash):</b>",
+        f"🧠 <b>ИИ (gemini-2.0-flash)</b>",
         f"• Действие: <code>{ai_result['action']}</code>",
         f"• Тема: <code>{current_theme}</code>",
     ]
-    if ai_result["missing_data"]:
+    if ai_result.get("missing_data"):
         analysis_blocks.append(f"• Не хватает: {', '.join(ai_result['missing_data'])}")
-    if ai_result["escalation_reason"]:
+    if ai_result.get("escalation_reason"):
         analysis_blocks.append(f"• 🔴 Причина: {ai_result['escalation_reason']}")
 
     await bot.send_message(
@@ -135,7 +148,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
     )
 
     # Эскалация → уведомление админов
-    if ai_result["action"] == "escalate" and ai_result["escalation_reason"]:
+    if ai_result.get("action") == "escalate" and ai_result.get("escalation_reason"):
         admin_tags = " ".join([f"<a href='tg://user?id={a}'>❗</a>" for a in ADMINS])
         await bot.send_message(
             chat_id=SUPPORT_GROUP_ID,
@@ -146,7 +159,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
 
     # Формируем ответ пользователю
     response_parts = []
-    if user.get("first_message_in_ticket") and ai_result["estimated_time"]:
+    if user.get("first_message_in_ticket") and ai_result.get("estimated_time"):
         notice = await load_text("ticket_notice", time=ai_result["estimated_time"])
         response_parts.append(notice)
     response_parts.append(ai_result["response_to_user"])
