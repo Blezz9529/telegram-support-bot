@@ -77,14 +77,19 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
     theme_name = data.get("theme_name", "Неизвестно")
     history = data.get("conversation_history", [])
 
-    # Скачиваем медиа, если есть
+    # 🔥 СКАЧИВАНИЕ МЕДИА + ОПРЕДЕЛЕНИЕ filename
     image_bytes = None
+    filename = None
+
     if message.photo:
         file = await bot.get_file(message.photo[-1].file_id)
         image_bytes = await bot.download_file(file.file_path)
-    elif message.document and message.document.mime_type.startswith('image/'):
+        filename = f"photo_{message.photo[-1].file_unique_id}.jpg"
+
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
         file = await bot.get_file(message.document.file_id)
         image_bytes = await bot.download_file(file.file_path)
+        filename = message.document.file_name or f"file_{message.document.file_unique_id}"
 
     # Формируем запись
     new_msg = {
@@ -98,14 +103,15 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         history = history[-10:]
     await state.update_data(conversation_history=history)
 
-    # 🔑 ВЫЗОВ ИИ С МЕДИА
+    # 🔥 ВЫЗОВ ИИ (добавлен filename)
     try:
         ai_result = await process_ticket(
             user_message=new_msg["text"],
             history=history,
             current_theme=current_theme,
             user_id=message.from_user.id,
-            image_bytes=image_bytes  # ← передаём байты
+            image_bytes=image_bytes,
+            filename=filename  # 👈 добавлено
         )
     except Exception as e:
         logger.exception("❌ Ошибка в process_ticket — fallback")
@@ -119,7 +125,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
             "estimated_time": "12 часов"
         }
 
-    # Обновление темы
+    # Обновление темы, если ИИ переопределил
     detected_theme = ai_result.get("detected_theme")
     if detected_theme and detected_theme != current_theme:
         theme_name = next((k for k, v in THEME_MAP.items() if v == detected_theme), "Другой вопрос")
@@ -127,15 +133,15 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         await update_user(message.from_user.id, theme=detected_theme)
         current_theme = detected_theme
 
-    # Получаем топик
+    # Получаем/создаём топик
     topic_id = await get_or_create_topic(
         bot, user["user_id"], user["username"], user["full_name"], theme_name
     )
 
-    # Пересылаем сообщение
+    # Пересылаем сообщение в топик
     await send_to_topic(bot, user, message, theme_name)
 
-    # ✅ ПОЛНЫЙ ОТВЕТ ИИ В ТОПИК
+    # Формирование текста для топика
     ai_response_text = ai_result["response_to_user"].strip()
     if ai_result.get("missing_data"):
         ai_response_text += "\n\n❓ Запрошены: " + ", ".join(ai_result["missing_data"])
@@ -159,7 +165,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         parse_mode="HTML"
     )
 
-    # ✅ УВЕДОМЛЕНИЕ АДМИНОВ — ТОЛЬКО ПРИ ЭСКАЛАЦИИ
+    # Уведомление админов при эскалации
     if ai_result.get("action") == "escalate" and ai_result.get("escalation_reason"):
         admin_tags = " ".join([f"<a href='tg://user?id={a}'>❗</a>" for a in ADMINS])
         await bot.send_message(
@@ -179,7 +185,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
 
     await message.answer(final_response)
 
-    # Обновляем историю
+    # Сохраняем в историю
     history.append({
         "from_user": False,
         "text": final_response,
@@ -188,5 +194,6 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
     })
     await state.update_data(conversation_history=history[-10:])
 
+    # Сбрасываем флаг первого сообщения
     if user.get("first_message_in_ticket"):
         await update_user(message.from_user.id, first_message_in_ticket=0)
