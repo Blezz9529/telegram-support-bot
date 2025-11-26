@@ -77,13 +77,12 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
     theme_name = data.get("theme_name", "Неизвестно")
     history = data.get("conversation_history", [])
 
-    # 🔑 Скачиваем медиа (если есть) и конвертируем в bytes
+    # Скачиваем медиа
     image_bytes = None
     filename = ""
     if message.photo:
         file = await bot.get_file(message.photo[-1].file_id)
         image_bytes = await bot.download_file(file.file_path)
-        # Конвертируем BytesIO → bytes
         if hasattr(image_bytes, 'getvalue'):
             image_bytes = image_bytes.getvalue()
         filename = f"photo_{message.photo[-1].file_unique_id}.jpg"
@@ -94,7 +93,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
             image_bytes = image_bytes.getvalue()
         filename = message.document.file_name or ""
 
-    # Формируем запись сообщения
+    # Добавляем в историю
     new_msg = {
         "from_user": True,
         "text": message.text or message.caption or "",
@@ -106,7 +105,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         history = history[-10:]
     await state.update_data(conversation_history=history)
 
-    # 🔑 ВЫЗОВ ИИ (асинхронный, с image_bytes)
+    # Вызов ИИ
     try:
         ai_result = await process_ticket(
             user_message=new_msg["text"],
@@ -141,10 +140,10 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         bot, user["user_id"], user["username"], user["full_name"], theme_name
     )
 
-    # Пересылаем сообщение в топик
+    # Пересылаем сообщение
     await send_to_topic(bot, user, message, theme_name)
 
-    # ✅ ПОЛНЫЙ ОТВЕТ ИИ В ТОПИК (читаемый, без технических деталей)
+    # Формируем полный ответ ИИ для топика
     ai_response_text = ai_result["response_to_user"].strip()
     if ai_result.get("missing_data"):
         ai_response_text += "\n\n❓ Запрошены: " + ", ".join(ai_result["missing_data"])
@@ -168,7 +167,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         parse_mode="HTML"
     )
 
-    # ✅ УВЕДОМЛЕНИЕ АДМИНОВ — ТОЛЬКО ПРИ ЭСКАЛАЦИИ
+    # Уведомление админов — ТОЛЬКО при эскалации
     if ai_result.get("action") == "escalate" and ai_result.get("escalation_reason"):
         admin_tags = " ".join([f"<a href='tg://user?id={a}'>❗</a>" for a in ADMINS])
         await bot.send_message(
@@ -178,17 +177,20 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
             parse_mode="HTML"
         )
 
-    # Ответ пользователю
+    # Ответ пользователю — с защитой от пустого текста
     response_parts = []
     if user.get("first_message_in_ticket") and ai_result.get("estimated_time"):
         notice = await load_text("ticket_notice", time=ai_result["estimated_time"])
         response_parts.append(notice)
     response_parts.append(ai_result["response_to_user"])
+
     final_response = "\n\n".join(filter(None, response_parts))
+    if not final_response.strip():
+        final_response = "Спасибо за обращение. Оператор скоро свяжется с вами."
 
     await message.answer(final_response)
 
-    # Сохраняем ответ бота в историю
+    # Обновляем историю
     history.append({
         "from_user": False,
         "text": final_response,

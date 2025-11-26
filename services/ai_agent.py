@@ -4,7 +4,6 @@ import json
 import logging
 import asyncio
 from typing import Any, Dict, List, Optional
-
 try:
     import google.generativeai as genai
     from google.generativeai.types import GenerationConfig
@@ -24,6 +23,7 @@ ENABLE_MEDIA_ANALYSIS = True
 
 
 class AgentResponse:
+    """Простая замена Pydantic-модели для fallback-совместимости"""
     def __init__(self, **kwargs):
         self.action = kwargs.get("action", "reply")
         self.response_to_user = kwargs.get("response_to_user", "")
@@ -96,35 +96,13 @@ def _get_gemini_model():
     return _gemini_model
 
 
-async def _call_gemini_with_contents(contents):
-    model = _get_gemini_model()
-    if not model:
-        return None
-
-    logger.info(f"📤 Gemini: промпт (длина={len(contents)}):\n{contents}")
-
-    try:
-        response = await asyncio.to_thread(model.generate_content, contents)
-        if not response or not response.text:
-            logger.warning("❌ Gemini: пустой ответ")
-            return None
-
-        logger.info(f"📥 Gemini: ответ (длина={len(response.text)}):\n{response.text}")
-        data = json.loads(response.text.strip())
-        return AgentResponse(**data)
-    except Exception as e:
-        logger.exception("💥 Gemini: ошибка вызова")
-        return None
-
-
 def _build_prompt(user_message, history, theme, user_id, has_media=False):
     rules = THEME_RULES.get(theme, THEME_RULES["default"])
     history_preview = "\n".join([
         f"{'👤' if h.get('from_user') else '🤖'}: {h.get('text', '')}"
         for h in history[-5:]
     ])
-
-    base = f"""[КОНТЕКСТ]
+    return f"""[КОНТЕКСТ]
 USER_ID: {user_id}
 Тема: {theme}
 Требуемые данные: {rules['required_data']}
@@ -152,7 +130,44 @@ USER_ID: {user_id}
 
 [НОВОЕ СООБЩЕНИЕ]
 {user_message}"""
-    return base
+
+
+async def _call_gemini_with_contents(contents):
+    model = _get_gemini_model()
+    if not model:
+        return None
+
+    logger.info(f"📤 Gemini: промпт (полный):\n{contents}")
+
+    try:
+        response = await asyncio.to_thread(model.generate_content, contents)
+        if not response or not response.text:
+            logger.warning("❌ Gemini: пустой ответ")
+            return None
+
+        logger.info(f"📥 Gemini: ответ (полный):\n{response.text}")
+        return AgentResponse(**json.loads(response.text.strip()))
+    except Exception as e:
+        logger.exception("💥 Gemini: ошибка вызова")
+        return None
+
+
+def _fallback_response(user_message: str, theme: str) -> AgentResponse:
+    text = (user_message or "").lower()
+    rules = THEME_RULES.get(theme, THEME_RULES["default"])
+    for trigger in rules["escalation_conditions"]:
+        if trigger in text:
+            return AgentResponse(
+                action="escalate",
+                response_to_user="Ваш запрос передан оператору.",
+                escalation_reason=f"Триггер: {trigger}",
+                estimated_time="2 часа" if theme == "deposit" else "12 часов"
+            )
+    return AgentResponse(
+        action="reply",
+        response_to_user="Спасибо за информацию! Оператор свяжется при необходимости.",
+        estimated_time=""
+    )
 
 
 async def process_ticket(
@@ -172,12 +187,8 @@ async def process_ticket(
         try:
             mime_type = determine_mime_type(image_bytes, filename)
             logger.info(f"🖼️ Медиа: {len(image_bytes)} байт, MIME={mime_type}")
-            if mime_type.startswith("image/") or mime_type == "application/pdf":
-                image_part = genai.Part.from_data(
-                    data=image_bytes,
-                    mime_type=mime_type
-                )
-                contents = [image_part, user_message]
+            image_part = genai.Part.from_data(data=image_bytes, mime_type=mime_type)
+            contents = [image_part, user_message]
         except Exception as e:
             logger.error(f"❌ Ошибка создания Part: {e}")
 
@@ -194,12 +205,13 @@ async def process_ticket(
         }
 
     logger.warning("⚠️ Используется fallback-логика")
+    fallback = _fallback_response(user_message, theme)
     return {
-        "action": "reply",
-        "response_to_user": "Спасибо за информацию! Оператор свяжется при необходимости.",
-        "detected_theme": theme,
-        "data_collected": {},
-        "missing_data": [],
-        "escalation_reason": None,
-        "estimated_time": ""
+        "action": fallback.action,
+        "response_to_user": fallback.response_to_user,
+        "detected_theme": fallback.detected_theme,
+        "data_collected": fallback.data_collected,
+        "missing_data": fallback.missing_data,
+        "escalation_reason": fallback.escalation_reason,
+        "estimated_time": fallback.estimated_time
     }
