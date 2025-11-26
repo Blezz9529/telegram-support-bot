@@ -4,14 +4,15 @@ import json
 import logging
 import asyncio
 from typing import Any, Dict, List, Optional
+
+# === Импорты Google AI (без Part) ===
 try:
     import google.generativeai as genai
     from google.generativeai.types import GenerationConfig
     _GOOGLE_AVAILABLE = True
 except ImportError as e:
     _GOOGLE_AVAILABLE = False
-    logging.critical(f"❌ ОШИБКА импорта google.generativeai: {e!r}")
-    logging.exception("Детали:")
+    logging.critical(f"❌ google-generativeai не установлен: {e!r}")
 
 try:
     import imghdr
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 ENABLE_MEDIA_ANALYSIS = True
 
 
-# === Автоопределение MIME ===
+# === Автоопределение MIME-типа ===
 def determine_mime_type(data: bytes, filename: str = "") -> str:
     if _IMGHDR_AVAILABLE:
         img_type = imghdr.what(None, data)
@@ -47,7 +48,7 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     if not _GOOGLE_AVAILABLE:
         return None
     if _gemini_model is None:
-        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")
+        api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             logger.error("❌ GEMINI_API_KEY не задан")
             return None
@@ -71,40 +72,33 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     return _gemini_model
 
 
-# === Парсинг ответа с fallback'ом ===
+# === Парсинг ответа по префиксам ===
 def parse_gemini_response(raw_text: str) -> Dict[str, Any]:
-    # 1. Попытка JSON
-    try:
-        data = json.loads(raw_text.strip())
-        content = str(data.get("response", data.get("content", data.get("response_to_user", ""))))
-    except:
-        content = raw_text.strip()
-
-    # 2. Логика по префиксам
-    if content.startswith("[ESCALATE]"):
-        reason = content.split(":", 1)[-1].strip() if ":" in content else "авто-эскалация"
+    text = raw_text.strip()
+    if text.startswith("[ESCALATE]"):
+        reason = text.split(":", 1)[-1].strip() if ":" in text else "эскалация по префиксу"
         return {
             "action": "escalate",
-            "response_to_user": content.replace("[ESCALATE]", "", 1).strip(),
+            "response_to_user": text.replace("[ESCALATE]", "", 1).strip(),
             "escalation_reason": reason,
             "estimated_time": "12 часов"
         }
-    elif content.startswith("[COLLECT]"):
+    elif text.startswith("[COLLECT]"):
         return {
             "action": "collect_data",
-            "response_to_user": content.replace("[COLLECT]", "", 1).strip(),
+            "response_to_user": text.replace("[COLLECT]", "", 1).strip(),
             "missing_data": ["документы"],
             "estimated_time": "2 часа"
         }
     else:
         return {
             "action": "reply",
-            "response_to_user": content,
+            "response_to_user": text,
             "estimated_time": ""
         }
 
 
-# === Промпт (без JSON-схемы — только инструкция) ===
+# === Построение промпта (без JSON-схемы) ===
 def _build_prompt(
     user_message: str,
     history: List[Dict[str, Any]],
@@ -125,7 +119,7 @@ USER_ID: {user_id}
   [REPLY] — обычная информация
   [COLLECT] — нужны документы
   [ESCALATE] — эскалация (угрозы, жалобы, мошенничество)
-— После префикса — только текст, никаких JSON, кода, markdown.
+— После префикса — только текст, никаких JSON, markdown.
 — Если есть медиа — проанализируй его и ответь по сути.
 
 [ИСТОРИЯ]
@@ -135,7 +129,7 @@ USER_ID: {user_id}
 {user_message}"""
 
 
-# === Вызов модели с корректным контентом ===
+# === Вызов модели с корректной передачей медиа ===
 async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
     model = _get_gemini_model()
     if not model:
@@ -194,18 +188,25 @@ async def process_ticket(
     theme = current_theme or "default"
     logger.info(f"🆕 Запрос ИИ: user_id={user_id}, тема={theme}, сообщение='{user_message}'")
 
-    # Формируем контент
+    # Формируем промпт
     prompt = _build_prompt(user_message, history, theme, user_id, bool(image_bytes))
-    contents = prompt
 
+    # Подготавливаем контент
     if ENABLE_MEDIA_ANALYSIS and image_bytes:
         try:
             mime_type = determine_mime_type(image_bytes, filename)
             logger.info(f"🖼️ Медиа: {len(image_bytes)} байт, MIME={mime_type}")
-            image_part = genai.Part.from_data(data=image_bytes, mime_type=mime_type)
+            # ✅ Правильный способ для gemini-2.0-flash (без Part!)
+            image_part = {
+                "mime_type": mime_type,
+                "data": image_bytes
+            }
             contents = [image_part, prompt]
         except Exception as e:
-            logger.error(f"❌ Ошибка создания Part: {e}")
+            logger.error(f"❌ Ошибка подготовки медиа: {e}")
+            contents = [prompt]
+    else:
+        contents = [prompt]
 
     # Вызов ИИ
     ai_result = await _call_gemini_with_contents(contents)
