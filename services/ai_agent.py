@@ -3,64 +3,43 @@ import os
 import json
 import logging
 import asyncio
-from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field, ValidationError
 import subprocess
 import sys
+from typing import Any, Dict, List, Optional
 
-# === Установка уровня логирования сразу ===
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-
-# === Проверка и логирование зависимостей при старте ===
-def log_installed_packages():
-    try:
-        result = subprocess.run([sys.executable, '-m', 'pip', 'list'], 
-                              capture_output=True, text=True, timeout=5)
-        logger.info("📦 Установленные пакеты (первые 2000 символов):\n" + result.stdout[:2000])
-    except Exception as e:
-        logger.warning(f"⚠️ Не удалось получить список пакетов: {e}")
-
-log_installed_packages()
-
-
-# === Импорты Google AI (с логированием ошибок) ===
+# === Системные импорты ===
 try:
     import google.generativeai as genai
     from google.generativeai.types import GenerationConfig
     _GOOGLE_AVAILABLE = True
-    logger.info("✅ google-generativeai импортирован")
 except ImportError as e:
-    logger.critical(f"❌ ОШИБКА импорта google.generativeai: {e!r}")
-    logger.exception("Детали:")
     _GOOGLE_AVAILABLE = False
+    logging.critical(f"❌ ОШИБКА импорта google.generativeai: {e!r}")
+    logging.exception("Детали:")
 
-
-# === Импорты для MIME (optional) ===
+# === Доп. импорты (опционально) ===
 try:
     import imghdr
     _IMGHDR_AVAILABLE = True
 except ImportError:
     _IMGHDR_AVAILABLE = False
 
+logger = logging.getLogger(__name__)
 
-# ✅ МОДУЛЬНЫЙ ФЛАГ: включите/отключите анализ медиа здесь
+# ✅ Модульный флаг: включить/отключить анализ медиа
 ENABLE_MEDIA_ANALYSIS = True
 
 
-# === 1. Строгая Pydantic-модель ответа (исправление model_type) ===
-class AgentResponse(BaseModel):
-    action: str = Field(..., pattern=r"^(reply|collect_data|escalate)$")
-    response_to_user: str
-    detected_theme: Optional[str] = None
-    data_collected: Dict[str, Any] = Field(default_factory=dict)
-    missing_data: List[str] = Field(default_factory=list)
-    escalation_reason: Optional[str] = None
-    estimated_time: Optional[str] = None
+# === 1. Простая совместимая структура ответа (без strict Pydantic) ===
+class AgentResponse:
+    def __init__(self, **kwargs):
+        self.action = kwargs.get("action", "reply")
+        self.response_to_user = kwargs.get("response_to_user", "")
+        self.detected_theme = kwargs.get("detected_theme")
+        self.data_collected = kwargs.get("data_collected", {})
+        self.missing_data = kwargs.get("missing_data", [])
+        self.escalation_reason = kwargs.get("escalation_reason")
+        self.estimated_time = kwargs.get("estimated_time")
 
 
 # === 2. Тематические правила ===
@@ -80,7 +59,7 @@ THEME_RULES = {
 }
 
 
-# === 3. Автоопределение MIME ===
+# === 3. Определение MIME-типа с fallback'ом ===
 def determine_mime_type(data: bytes, filename: str = "") -> str:
     if _IMGHDR_AVAILABLE:
         img_type = imghdr.what(None, data)
@@ -103,13 +82,11 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     global _gemini_model
     if not _GOOGLE_AVAILABLE:
         return None
-
     if _gemini_model is None:
         api_key = os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")
         if not api_key:
             logger.error("❌ GEMINI_API_KEY не задан")
             return None
-
         try:
             genai.configure(api_key=api_key)
             _gemini_model = genai.GenerativeModel(
@@ -120,13 +97,9 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
                     max_output_tokens=768,
                     response_mime_type="application/json"
                 ),
-                system_instruction=(
-                    "Ты — ИИ-агент поддержки. "
-                    "ОТВЕЧАЙ СТРОГО ВАЛИДНЫМ JSON НИЧЕГО КРОМЕ ОБЪЕКТА AgentResponse. "
-                    "Не добавляй пояснений, ```json```, комментариев."
-                )
+                system_instruction="Ты — ИИ-агент поддержки. Отвечай ТОЛЬКО валидным JSON."
             )
-            _gemini_model.generate_content("OK", generation_config={"max_output_tokens": 1})
+            _gemini_model.generate_content("OK", generation_config={"max_output_tokens":1})
             logger.info("✅ Gemini: модель gemini-2.0-flash инициализирована")
         except Exception as e:
             logger.error(f"❌ Gemini: ошибка инициализации: {e}")
@@ -134,7 +107,58 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     return _gemini_model
 
 
-# === 5. Построение промпта ===
+# === 5. Универсальный парсер ответа с fallback'ом ===
+def parse_gemini_response(raw_text: str) -> AgentResponse:
+    """
+    Парсит ответ Gemini, даже если он:
+      - обёрнут в {"agentResponse": {...}}
+      - содержит префиксы [REPLY]/[COLLECT]/[ESCALATE]
+      - невалидный JSON
+    Всегда возвращает валидный AgentResponse.
+    """
+    # 1. Попытка JSON
+    try:
+        data = json.loads(raw_text.strip())
+        if isinstance(data, dict) and "agentResponse" in data:
+            data = data["agentResponse"]
+        return AgentResponse(**{
+            "action": str(data.get("action", "reply")),
+            "response_to_user": str(data.get("response_to_user", data.get("content", raw_text[:200]))),
+            "detected_theme": data.get("detected_theme"),
+            "data_collected": data.get("data_collected", {}),
+            "missing_data": data.get("missing_data", []),
+            "escalation_reason": data.get("escalation_reason"),
+            "estimated_time": data.get("estimated_time")
+        })
+    except Exception as e:
+        logger.warning(f"⚠️ JSON-парсинг не удался ({e}). Пробуем текстовую логику.")
+
+    # 2. Текстовая логика с префиксами
+    text = raw_text.strip()
+    if text.startswith("[ESCALATE]"):
+        reason = text.split(":", 1)[-1].strip() if ":" in text else "эскалация по префиксу"
+        return AgentResponse(
+            action="escalate",
+            response_to_user=text.replace("[ESCALATE]", "", 1).strip(),
+            escalation_reason=reason,
+            estimated_time="12 часов"
+        )
+    elif text.startswith("[COLLECT]"):
+        return AgentResponse(
+            action="collect_data",
+            response_to_user=text.replace("[COLLECT]", "", 1).strip(),
+            missing_data=["документы"],
+            estimated_time="2 часа"
+        )
+    else:
+        return AgentResponse(
+            action="reply",
+            response_to_user=text,
+            estimated_time=""
+        )
+
+
+# === 6. Построение промпта (без строгого JSON-формата) ===
 def _build_prompt(
     user_message: str,
     history: List[Dict[str, Any]],
@@ -147,7 +171,6 @@ def _build_prompt(
         f"{'👤' if h.get('from_user') else '🤖'}: {h.get('text', '')}"
         for h in history[-5:]
     ])
-
     return f"""[КОНТЕКСТ]
 USER_ID: {user_id}
 Тема: {theme}
@@ -155,21 +178,11 @@ USER_ID: {user_id}
 Триггеры эскалации: {rules['escalation_conditions']}
 
 [ИНСТРУКЦИЯ]
-1. Если есть триггеры → action="escalate"
-2. Если пользователь отправил фото/документ → action="reply" (анализируй содержимое)
-3. Если нет данных по required_data → action="collect_data"
-4. estimated_time: "2 ч" для deposit, "1 ч" для partnership, "12 ч" иначе
-
-[ФОРМАТ ОТВЕТА СТРОГО JSON — ТОЛЬКО ОБЪЕКТ, НИЧЕГО КРОМЕ]
-{{
-  "action": "reply|collect_data|escalate",
-  "response_to_user": "строка без кавычек — экранируй как \\\"",
-  "detected_theme": "тема или null",
-  "data_collected": {{}},
-  "missing_data": [],
-  "escalation_reason": "строка или null",
-  "estimated_time": "строка или null"
-}}
+— Отвечай только на русском.
+— Если нужна эскалация — начни с: [ESCALATE] Причина: ...
+— Если нужны документы — начни с: [COLLECT] Пожалуйста, пришлите: ...
+— Иначе — просто текст: [REPLY] Текст...
+— НЕ используй markdown, JSON-обёртки, пояснения.
 
 [ИСТОРИЯ]
 {history_preview}
@@ -178,13 +191,12 @@ USER_ID: {user_id}
 {user_message}"""
 
 
-# === 6. Вызов модели с полным логированием и обработкой ошибок ===
+# === 7. Вызов модели с полным логированием ===
 async def _call_gemini_with_contents(contents: List[Any]) -> Optional[AgentResponse]:
     model = _get_gemini_model()
     if not model:
         return None
 
-    # ✅ Полное логирование — без обрезки
     logger.info(f"📤 Gemini: промпт (полный):\n{contents}")
 
     try:
@@ -194,46 +206,14 @@ async def _call_gemini_with_contents(contents: List[Any]) -> Optional[AgentRespo
             return None
 
         logger.info(f"📥 Gemini: ответ (полный):\n{response.text}")
-
-        # ✅ Валидация через Pydantic — устраняет model_type
-        return AgentResponse.model_validate(json.loads(response.text.strip()))
-
-    except (json.JSONDecodeError, ValidationError) as e:
-        logger.error(f"❌ Невалидный JSON от Gemini: {e}")
-        logger.warning(f"Сырой ответ: {response.text[:500]}...")
-
-        # 🔑 Fallback: извлекаем response_to_user вручную
-        import re
-        match = re.search(r'"response_to_user"\s*:\s*"([^"]*)"', response.text)
-        if match:
-            text = match.group(1).replace('\\"', '"').replace('\\n', '\n')
-            logger.info(f"✅ Удалось извлечь response_to_user: {text}")
-            return AgentResponse(
-                action="reply",
-                response_to_user=text or "Спасибо за обращение.",
-                detected_theme=None,
-                data_collected={},
-                missing_data=[],
-                escalation_reason=None,
-                estimated_time=""
-            )
-
-        return AgentResponse(
-            action="reply",
-            response_to_user="Спасибо за обращение. Оператор скоро свяжется с вами.",
-            detected_theme=None,
-            data_collected={},
-            missing_data=[],
-            escalation_reason=None,
-            estimated_time=""
-        )
+        return parse_gemini_response(response.text)
 
     except Exception as e:
         logger.exception("💥 Ошибка вызова Gemini")
         return None
 
 
-# === 7. Fallback-логика ===
+# === 8. Fallback-логика на случай падения ИИ ===
 def _fallback_response(user_message: str, theme: str) -> AgentResponse:
     text = (user_message or "").lower()
     rules = THEME_RULES.get(theme, THEME_RULES["default"])
@@ -245,6 +225,13 @@ def _fallback_response(user_message: str, theme: str) -> AgentResponse:
                 escalation_reason=f"Триггер: {trigger}",
                 estimated_time="2 часа" if theme == "deposit" else "12 часов"
             )
+    if theme == "deposit":
+        return AgentResponse(
+            action="collect_data",
+            response_to_user="Пожалуйста, пришлите любые документы, подтверждающие ваш запрос.",
+            missing_data=["Любые доказательства"],
+            estimated_time="2 часа"
+        )
     return AgentResponse(
         action="reply",
         response_to_user="Спасибо за информацию! Оператор свяжется при необходимости.",
@@ -252,7 +239,7 @@ def _fallback_response(user_message: str, theme: str) -> AgentResponse:
     )
 
 
-# === 8. ОСНОВНОЙ ВХОД (асинхронный) ===
+# === 9. ОСНОВНОЙ ВХОД (асинхронный) ===
 async def process_ticket(
     *,
     user_message: str,
@@ -265,23 +252,44 @@ async def process_ticket(
     theme = current_theme or "default"
     logger.info(f"🆕 Запрос ИИ: user_id={user_id}, тема={theme}, сообщение='{user_message}'")
 
-    # 🔑 Формируем контент
+    # 🔑 Формируем контент: [image?, prompt]
     contents = [user_message]
     if ENABLE_MEDIA_ANALYSIS and image_bytes:
         try:
             mime_type = determine_mime_type(image_bytes, filename)
             logger.info(f"🖼️ Медиа: {len(image_bytes)} байт, MIME={mime_type}")
             image_part = genai.Part.from_data(data=image_bytes, mime_type=mime_type)
-            contents = [image_part, user_message]
+            prompt = _build_prompt(user_message, history, theme, user_id, has_media=True)
+            contents = [image_part, prompt]
         except Exception as e:
             logger.error(f"❌ Ошибка создания Part: {e}")
+            prompt = _build_prompt(user_message, history, theme, user_id, has_media=False)
+            contents = [prompt]
+    else:
+        prompt = _build_prompt(user_message, history, theme, user_id, has_media=False)
+        contents = [prompt]
 
     # Вызов ИИ
     ai_result = await _call_gemini_with_contents(contents)
     if ai_result:
-        return ai_result.model_dump()
+        return {
+            "action": ai_result.action,
+            "response_to_user": ai_result.response_to_user,
+            "detected_theme": ai_result.detected_theme,
+            "data_collected": ai_result.data_collected,
+            "missing_data": ai_result.missing_data,
+            "escalation_reason": ai_result.escalation_reason,
+            "estimated_time": ai_result.estimated_time
+        }
 
-    # Fallback
     logger.warning("⚠️ Используется fallback-логика")
     fallback = _fallback_response(user_message, theme)
-    return fallback.model_dump()
+    return {
+        "action": fallback.action,
+        "response_to_user": fallback.response_to_user,
+        "detected_theme": fallback.detected_theme,
+        "data_collected": fallback.data_collected,
+        "missing_data": fallback.missing_data,
+        "escalation_reason": fallback.escalation_reason,
+        "estimated_time": fallback.estimated_time
+    }
