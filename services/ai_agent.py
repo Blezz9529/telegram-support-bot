@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 ENABLE_MEDIA_ANALYSIS = True
 
 
-# === Автоопределение MIME ===
+# === MIME-определение ===
 def determine_mime_type( bytes, filename: str = "") -> str:
     if _IMGHDR_AVAILABLE:
         img_type = imghdr.what(None, data)
@@ -62,12 +62,7 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
                     max_output_tokens=768,
                     response_mime_type="application/json"
                 ),
-                system_instruction=(
-                    "Ты — вежливый и компетентный ИИ-агент поддержки. "
-                    "Отвечай кратко, по-русски, только по сути. "
-                    "Если нужны документы — попроси конкретно: 'Пожалуйста, пришлите...'. "
-                    "Если нужна помощь оператора — скажи: 'Передаю ваш запрос оператору' и вызови эскалацию."
-                )
+                system_instruction="Ты — вежливый ИИ-агент поддержки. Отвечай на русском, кратко, по делу."
             )
             _gemini_model.generate_content("OK", generation_config={"max_output_tokens": 1})
             logger.info("✅ Gemini: модель gemini-2.0-flash инициализирована")
@@ -77,9 +72,9 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     return _gemini_model
 
 
-# === Очистка текста от мусора ===
+# === Очистка ответа ===
 def clean_gemini_response(text: str) -> str:
-    # Убираем JSON-обёртку вида ["..."] или {"response": "..."}
+    # Убираем JSON-обёртки вида ["..."] и {"response": "..."}
     try:
         data = json.loads(text.strip())
         if isinstance(data, list) and len(data) > 0:
@@ -88,27 +83,11 @@ def clean_gemini_response(text: str) -> str:
             text = str(data["response"])
     except:
         pass
-
-    # Убираем бинарный мусор и непечатаемые символы
+    # Убираем бинарный мусор
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
-
-    # Убираем технические префиксы, оставляя только содержание
+    # Убираем технические префиксы
     text = re.sub(r'^\[(REPLY|COLLECT|ESCALATE)\]\s*', '', text, flags=re.IGNORECASE)
-
     return text
-
-
-# === Парсинг действия по ключевым словам ===
-def parse_action(text: str) -> Dict[str, Any]:
-    lower = text.lower()
-    escalation_triggers = ["угроз", "суд", "жалоб", "мошенник", "кинули", "оператор", "человек", "живой"]
-    
-    if any(t in lower for t in escalation_triggers):
-        return {
-            "action": "escalate",
-            "escalation_reason": "авто-эскалация по ключевым словам"
-        }
-    return {"action": "reply"}
 
 
 # === Вызов модели ===
@@ -125,19 +104,23 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
             logger.warning("❌ Gemini: пустой ответ")
             return None
 
-        logger.info(f"📥 Gemini: сырой ответ:\n{response.text}")
-
-        # Очистка и парсинг
+        logger.info(f"📥 Gemini: ответ (сырой):\n{response.text}")
         clean_text = clean_gemini_response(response.text)
-        action_data = parse_action(clean_text)
+        logger.info(f"✅ Gemini: очищенный ответ:\n{clean_text}")
 
-        logger.info(f"✅ Gemini: очищенный ответ: {clean_text}")
+        # Авто-эскалация
+        lower = clean_text.lower()
+        escalation_triggers = ["угроз", "суд", "жалоб", "мошенник", "кинули", "оператор", "человек"]
+        escalation = any(t in lower for t in escalation_triggers)
+
+        action = "escalate" if escalation else "reply"
+        estimate = "12 часов" if escalation else ""
 
         return {
-            "action": action_data["action"],
+            "action": action,
             "response_to_user": clean_text,
-            "escalation_reason": action_data.get("escalation_reason"),
-            "estimated_time": "12 часов" if action_data["action"] == "escalate" else ""
+            "escalation_reason": "авто-эскалация" if escalation else None,
+            "estimated_time": estimate
         }
 
     except Exception as e:
@@ -157,7 +140,7 @@ def _fallback_response(user_message: str, theme: str) -> Dict[str, Any]:
         }
     return {
         "action": "reply",
-        "response_to_user": "Спасибо за обращение. Оператор скоро свяжется с вами.",
+        "response_to_user": "Спасибо за информацию. Оператор скоро свяжется с вами.",
         "estimated_time": ""
     }
 
@@ -175,7 +158,7 @@ async def process_ticket(
     theme = current_theme or "deposit"
     logger.info(f"🆕 Запрос ИИ: user_id={user_id}, тема={theme}, сообщение='{user_message}'")
 
-    # Формируем промпт (без JSON-схемы)
+    # Формируем промпт (только текст)
     prompt = (
         f"USER_ID: {user_id}\n"
         f"Тема: {theme}\n"
@@ -191,8 +174,11 @@ async def process_ticket(
         try:
             mime_type = determine_mime_type(image_bytes, filename)
             logger.info(f"🖼️ Медиа: {len(image_bytes)} байт, MIME={mime_type}")
-            image_part = {"mime_type": mime_type, "data": image_bytes}
-            contents = [image_part, prompt]
+            # ✅ Правильный способ для gemini-2.0-flash (без Part!)
+            contents = [
+                {"mime_type": mime_type, "data": image_bytes},
+                prompt
+            ]
         except Exception as e:
             logger.error(f"❌ Ошибка подготовки медиа: {e}")
             contents = [prompt]
