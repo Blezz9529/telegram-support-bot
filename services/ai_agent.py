@@ -133,7 +133,7 @@ def _build_prompt(
         for h in history[-5:]
     ])
 
-    base_prompt = f"""[КОНТЕКСТ]
+base_prompt = f"""[КОНТЕКСТ]
 USER_ID: {user_id}
 Тема: {theme}
 Требуемые данные: {rules['required_data']}
@@ -146,15 +146,15 @@ USER_ID: {user_id}
 4. estimated_time: "2 ч" для deposit, "1 ч" для partnership, "12 ч" иначе
 
 [ФОРМАТ ОТВЕТА СТРОГО JSON]
-{
+{{
   "action": "reply|collect_data|escalate",
   "response_to_user": "...",
   "detected_theme": "...",
-  "data_collected": {...},
-  "missing_data": [...],
+  "data_collected": {{}},
+  "missing_data": [],
   "escalation_reason": "...",
   "estimated_time": "..."
-}
+}}
 
 [ИСТОРИЯ]
 {history_preview}
