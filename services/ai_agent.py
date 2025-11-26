@@ -2,22 +2,33 @@
 import os
 import json
 import logging
+import subprocess
+import sys
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, ValidationError
 import asyncio
 
-# === Опциональные импорты Google AI ===
+# === Проверка и логирование установленных пакетов при старте ===
+def log_installed_packages():
+    try:
+        result = subprocess.run([sys.executable, '-m', 'pip', 'list'], capture_output=True, text=True, timeout=10)
+        logging.info("📦 Установленные пакеты:\n" + result.stdout[:2000] + ("..." if len(result.stdout) > 2000 else ""))
+    except Exception as e:
+        logging.warning(f"⚠️ Не удалось получить список пакетов: {e}")
+
+log_installed_packages()
+
+
+# === Импорты Google AI (без google.genai) ===
 try:
     import google.generativeai as genai
     from google.generativeai.types import GenerationConfig
-    from google.genai import types  # Для Part.from_bytes
     _GOOGLE_AVAILABLE = True
 except ImportError as e:
     logging.critical(f"❌ КРИТИЧЕСКАЯ ОШИБКА импорта google.generativeai: {e!r}")
     logging.exception("Детали импорта:")
     _GOOGLE_AVAILABLE = False
 
-# === Опциональные импорты для MIME ===
 try:
     import imghdr
     _IMGHDR_AVAILABLE = True
@@ -26,22 +37,22 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# ✅ МОДУЛЬНЫЙ ФЛАГ: включите анализ изображений здесь
+# ✅ Модульный флаг анализа медиа
 ENABLE_MEDIA_ANALYSIS = True
 
 
-# === 1. Схема ответа (Pydantic 2.11+) ===
+# === Схема ответа ===
 class AgentResponse(BaseModel):
     action: str = Field(..., pattern=r"^(reply|collect_data|escalate)$")
     response_to_user: str
     detected_theme: Optional[str] = None
     data_collected: Dict[str, Any] = Field(default_factory=dict)
-    missing_data: List[str] = Field(default_factory=list)
+    missing_ List[str] = Field(default_factory=list)
     escalation_reason: Optional[str] = None
     estimated_time: Optional[str] = None
 
 
-# === 2. Тематические правила ===
+# === Тематические правила ===
 THEME_RULES = {
     "deposit": {
         "required_data": ["payment_proof"],
@@ -58,7 +69,7 @@ THEME_RULES = {
 }
 
 
-# === 3. Автоопределение MIME ===
+# === Автоопределение MIME ===
 def determine_mime_type(data: bytes, filename: str = "") -> str:
     if _IMGHDR_AVAILABLE:
         img_type = imghdr.what(None, data)
@@ -74,7 +85,7 @@ def determine_mime_type(data: bytes, filename: str = "") -> str:
     return 'application/octet-stream'
 
 
-# === 4. Кэш модели ===
+# === Инициализация модели ===
 _gemini_model = None
 
 def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
@@ -108,7 +119,7 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     return _gemini_model
 
 
-# === 5. Построение промпта ===
+# === Формирование промпта ===
 def _build_prompt(
     user_message: str,
     history: List[Dict[str, Any]],
@@ -157,39 +168,54 @@ USER_ID: {user_id}
             "Если это скриншот — определи, содержит ли он: реквизиты, сумму, дату, логотип бота. "
             "Не выдумывай данные — если не видишь — пиши 'не удалось распознать'."
         )
-
     return base_prompt
 
 
-# === 6. Вызов модели с ЛОГИРОВАНИЕМ (без обрезки) ===
+# === Вызов модели с корректной обработкой медиа (без google.genai) ===
 async def _call_gemini_with_contents(contents: List[Any]) -> Optional[AgentResponse]:
     model = _get_gemini_model()
     if not model:
         return None
 
-    # 🔑 ЛОГИРУЕМ ВХОД ПОЛНОСТЬЮ — БЕЗ ОБРЕЗКИ
+    # Логируем вход
     logger.info(f"📤 Gemini: промпт (полный):\n{contents}")
 
     try:
-        response = await asyncio.to_thread(model.generate_content, contents)
+        # ✅ Работаем с Part.from_data (совместимо с 0.8.5+)
+        if len(contents) == 2 and isinstance(contents[0], bytes):
+            image_bytes, text = contents
+            mime_type = determine_mime_type(image_bytes)
+            logger.info(f"🖼️ Медиа: {len(image_bytes)} байт, MIME={mime_type}")
+            # Используем Part.from_data (новый способ)
+            try:
+                image_part = genai.Part.from_data(
+                    data=image_bytes,
+                    mime_type=mime_type
+                )
+                final_contents = [image_part, text]
+            except AttributeError:
+                # Fallback: только текст
+                logger.warning("⚠️ Part.from_data недоступен — медиа проигнорировано")
+                final_contents = [text]
+        else:
+            final_contents = contents
+
+        response = await asyncio.to_thread(model.generate_content, final_contents)
         if not response or not response.text:
             logger.warning("❌ Gemini: пустой ответ")
             return None
 
-        # 🔑 ЛОГИРУЕМ ВЫХОД ПОЛНОСТЬЮ — БЕЗ ОБРЕЗКИ
         logger.info(f"📥 Gemini: ответ (полный):\n{response.text}")
-
         return AgentResponse.model_validate(json.loads(response.text.strip()))
     except Exception as e:
         logger.exception("💥 Gemini: ошибка вызова")
         return None
 
 
-# === 7. Fallback-логика ===
+# === Fallback ===
 def _fallback_response(user_message: str, theme: str) -> AgentResponse:
     text = (user_message or "").lower()
     rules = THEME_RULES.get(theme, THEME_RULES["default"])
-
     for trigger in rules["escalation_conditions"]:
         if trigger in text:
             return AgentResponse(
@@ -198,7 +224,6 @@ def _fallback_response(user_message: str, theme: str) -> AgentResponse:
                 escalation_reason=f"Триггер: {trigger}",
                 estimated_time="2 часа" if theme == "deposit" else "12 часов"
             )
-
     if theme == "deposit":
         return AgentResponse(
             action="collect_data",
@@ -206,7 +231,6 @@ def _fallback_response(user_message: str, theme: str) -> AgentResponse:
             missing_data=["Любые доказательства"],
             estimated_time="2 часа"
         )
-
     return AgentResponse(
         action="reply",
         response_to_user="Спасибо за информацию! Оператор свяжется при необходимости.",
@@ -214,7 +238,7 @@ def _fallback_response(user_message: str, theme: str) -> AgentResponse:
     )
 
 
-# === 8. ОСНОВНОЙ ВХОД (асинхронный) ===
+# === Основной вход ===
 async def process_ticket(
     *,
     user_message: str,
@@ -227,24 +251,15 @@ async def process_ticket(
     theme = current_theme or "default"
     logger.info(f"🆕 Запрос ИИ: user_id={user_id}, тема={theme}, сообщение='{user_message}'")
 
-    # 🔑 ФОРМИРУЕМ КОНТЕНТ
+    # Формируем контент
     contents = [user_message]
     if ENABLE_MEDIA_ANALYSIS and image_bytes:
-        try:
-            mime_type = determine_mime_type(image_bytes, filename)
-            logger.info(f"🖼️ Медиа: {len(image_bytes)} байт, MIME={mime_type}")
-            if mime_type.startswith("image/") or mime_type == "application/pdf":
-                image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
-                contents = [image_part, user_message]
-        except Exception as e:
-            logger.error(f"❌ Ошибка создания Part: {e}")
+        contents = [image_bytes, user_message]
 
-    # ✅ ОСНОВНОЙ ВЫЗОВ
+    # Вызов
     ai_result = await _call_gemini_with_contents(contents)
     if ai_result:
         return ai_result.model_dump()
 
-    # ❗ Fallback
     logger.warning("⚠️ Используется fallback-логика")
-    fallback = _fallback_response(user_message, theme)
-    return fallback.model_dump()
+    return _fallback_response(user_message, theme).model_dump()
