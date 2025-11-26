@@ -77,16 +77,21 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
     theme_name = data.get("theme_name", "Неизвестно")
     history = data.get("conversation_history", [])
 
-    # 🔑 Скачиваем медиа (если есть) и определяем filename
+    # 🔑 Скачиваем медиа (если есть) и конвертируем в bytes
     image_bytes = None
     filename = ""
     if message.photo:
         file = await bot.get_file(message.photo[-1].file_id)
         image_bytes = await bot.download_file(file.file_path)
+        # Конвертируем BytesIO → bytes
+        if hasattr(image_bytes, 'getvalue'):
+            image_bytes = image_bytes.getvalue()
         filename = f"photo_{message.photo[-1].file_unique_id}.jpg"
     elif message.document:
         file = await bot.get_file(message.document.file_id)
         image_bytes = await bot.download_file(file.file_path)
+        if hasattr(image_bytes, 'getvalue'):
+            image_bytes = image_bytes.getvalue()
         filename = message.document.file_name or ""
 
     # Формируем запись сообщения
@@ -101,7 +106,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         history = history[-10:]
     await state.update_data(conversation_history=history)
 
-    # 🔑 ВЫЗОВ ИИ С МЕДИА И ПОЛНЫМ ПРОМПТОМ
+    # 🔑 ВЫЗОВ ИИ (асинхронный, с image_bytes)
     try:
         ai_result = await process_ticket(
             user_message=new_msg["text"],
@@ -131,12 +136,12 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         await update_user(message.from_user.id, theme=detected_theme)
         current_theme = detected_theme
 
-    # Получаем / создаём топик
+    # Получаем/создаём топик
     topic_id = await get_or_create_topic(
         bot, user["user_id"], user["username"], user["full_name"], theme_name
     )
 
-    # Пересылаем сообщение пользователя в топик
+    # Пересылаем сообщение в топик
     await send_to_topic(bot, user, message, theme_name)
 
     # ✅ ПОЛНЫЙ ОТВЕТ ИИ В ТОПИК (читаемый, без технических деталей)
