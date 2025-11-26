@@ -1,8 +1,10 @@
+# keyboards/reply.py
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from services.localization import load_button
 import asyncio
 
 async def get_main_menu() -> ReplyKeyboardMarkup:
+    """Основное меню — 2 колонки, адаптивно"""
     btns = [
         await load_button("menu", "leave_feedback"),
         await load_button("menu", "deposit_problem"),
@@ -11,5 +13,23 @@ async def get_main_menu() -> ReplyKeyboardMarkup:
         await load_button("menu", "partnership"),
         await load_button("menu", "other_question"),
     ]
-    keyboard = [[KeyboardButton(text=btn)] for btn in btns]
-    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True, one_time_keyboard=True)
+    # Разбиваем на 2 колонки: [ [btn1, btn2, btn3], [btn4, btn5, btn6] ]
+    keyboard = [
+        [KeyboardButton(text=btns[i]), KeyboardButton(text=btns[i+3])] 
+        for i in range(3)
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        one_time_keyboard=False  # остаётся, пока не скроем явно
+    )
+
+
+async def get_new_ticket_button() -> ReplyKeyboardMarkup:
+    """Клавиатура после выбора темы: только «Новая заявка»"""
+    btn = await load_button("menu", "new_ticket")
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=btn)]],
+        resize_keyboard=True,
+        one_time_keyboard=True  # исчезает после нажатия
+    )
