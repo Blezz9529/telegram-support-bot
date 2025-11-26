@@ -5,10 +5,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from config import SUPPORT_GROUP_ID, ADMINS
 from storages.db import get_user, create_user, update_user
-from services.localization import load_text, load_button
 from services.ai_agent import process_ticket
 from services.forum import send_to_topic, get_or_create_topic
-from keyboards.reply import get_main_menu, get_new_ticket_button
+from keyboards.reply import get_main_menu
 import logging
 
 router = Router()
@@ -35,65 +34,39 @@ async def cmd_start(message: Message, state: FSMContext):
     await create_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
     user = await get_user(message.from_user.id)
     if user and user["is_blocked"]:
-        await message.answer(await load_text("blocked"))
+        await message.answer("❌ Вы заблокированы.")
         return
 
     await state.set_data({"conversation_history": []})
     await state.set_state(SupportStates.choosing_theme)
-
-    await message.answer(
-        await load_text("start_message"),
-        reply_markup=await get_main_menu()
-    )
+    await message.answer("Выберите тему:", reply_markup=await get_main_menu())
 
 
 @router.message(SupportStates.choosing_theme, F.text)
 async def theme_chosen(message: Message, state: FSMContext):
-    theme_text = message.text
-    theme_key = THEME_MAP.get(theme_text)
+    theme_key = THEME_MAP.get(message.text)
     if not theme_key:
         await message.answer("Пожалуйста, выберите тему из меню.")
         return
 
     await update_user(message.from_user.id, first_message_in_ticket=1, theme=theme_key)
-    await state.update_data({
-        "theme": theme_key,
-        "theme_name": theme_text,
-        "conversation_history": []
-    })
+    await state.update_data({"theme": theme_key, "conversation_history": []})
     await state.set_state(SupportStates.in_conversation)
-
-    # ✅ Отправляем сообщение + скрываем старую клавиатуру
-    await message.answer(
-        await load_text("ask_details"),
-        reply_markup=await get_new_ticket_button()  # ← только «Новая заявка» после выбора
-    )
+    await message.answer("Опишите проблему.")
 
 
-@router.message(SupportStates.in_conversation, F.text == "Новая заявка")
-async def new_ticket_request(message: Message, state: FSMContext):
-    """Обработка кнопки «Новая заявка» в середине диалога"""
-    # Сбрасываем состояние и возвращаем к выбору темы
-    await state.set_state(SupportStates.choosing_theme)
-    await message.answer(
-        "Выберите новую тему:",
-        reply_markup=await get_main_menu()
-    )
-
-
-@router.message(SupportStates.in_conversation, F.text | F.photo | F.document | F.video)
+@router.message(SupportStates.in_conversation, F.text | F.photo | F.document)
 async def handle_message_in_conversation(message: Message, state: FSMContext, bot: Bot):
     user = await get_user(message.from_user.id)
     if not user or user["is_blocked"]:
-        await message.answer(await load_text("blocked"))
+        await message.answer("❌ Вы заблокированы.")
         return
 
     data = await state.get_data()
     current_theme = data.get("theme")
-    theme_name = data.get("theme_name", "Неизвестно")
     history = data.get("conversation_history", [])
 
-    # Скачиваем медиа
+    # Скачиваем медиа (если есть)
     image_bytes = None
     filename = ""
     if message.photo:
@@ -109,7 +82,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
             image_bytes = image_bytes.getvalue()
         filename = message.document.file_name or ""
 
-    # Подготавливаем запись сообщения (не добавляем в историю до вызова ИИ!)
+    # 🧠 Подготавливаем запись текущего сообщения (НЕ добавляем в историю до вызова ИИ!)
     new_msg = {
         "from_user": True,
         "text": message.text or message.caption or "",
@@ -117,47 +90,44 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         "timestamp": message.date.isoformat()
     }
 
-    # Подготовка истории ДЛЯ ИИ (без current message, с заменой медиа на [ИЗОБРАЖЕНИЕ])
+    # 🔑 ПОДГОТОВКА ИСТОРИИ ДЛЯ ИИ — ТОЛЬКО ПРЕДЫДУЩИЕ СООБЩЕНИЯ
     history_for_ai = []
-    for msg in history:  # ← только прошлые сообщения
+    for msg in history:  # ← history ещё без new_msg
         clean_msg = msg.copy()
         if msg.get("has_media"):
-            clean_msg["text"] = "[ИЗОБРАЖЕНИЕ]"
+            clean_msg["text"] = "[ИЗОБРАЖЕНИЕ]"  # экономим токены
         history_for_ai.append(clean_msg)
 
-    # Вызов ИИ
+    # 🔑 ВЫЗОВ ИИ — user_message отдельно, history_for_ai без дубля
     ai_result = await process_ticket(
         user_message=new_msg["text"],
-        history=history_for_ai,
+        history=history_for_ai,  # ✅ только прошлая история
         current_theme=current_theme,
         user_id=message.from_user.id,
         image_bytes=image_bytes,
         filename=filename
     )
 
-    # Только после вызова — обновляем историю
+    # 🔄 Только ПОСЛЕ вызова ИИ добавляем сообщение в историю
     history.append(new_msg)
     if len(history) > 10:
         history = history[-10:]
     await state.update_data(conversation_history=history)
 
     # Обновление темы при необходимости
-    detected_theme = ai_result.get("detected_theme")
-    if detected_theme and detected_theme != current_theme:
-        theme_name = next((k for k, v in THEME_MAP.items() if v == detected_theme), "Другой вопрос")
-        await state.update_data(theme=detected_theme, theme_name=theme_name)
-        await update_user(message.from_user.id, theme=detected_theme)
-        current_theme = detected_theme
+    if ai_result.get("detected_theme"):
+        await state.update_data(theme=ai_result["detected_theme"])
+        await update_user(message.from_user.id, theme=ai_result["detected_theme"])
 
-    # Получаем / создаём топик
+    # Получаем/создаём топик
     topic_id = await get_or_create_topic(
-        bot, user["user_id"], user["username"], user["full_name"], theme_name
+        bot, user["user_id"], user["username"], user["full_name"], current_theme or "Другой вопрос"
     )
 
     # Пересылаем сообщение
-    await send_to_topic(bot, user, message, theme_name)
+    await send_to_topic(bot, user, message, current_theme or "Другой вопрос")
 
-    # === ОТВЕТ В ТОПИК ===
+    # === ФОРМИРУЕМ ОТВЕТ В ТОПИК ===
     ai_text = ai_result["response_to_user"].strip()
     if ai_result.get("escalation_reason"):
         ai_text += f"\n\n🔴 Причина эскалации: {ai_result['escalation_reason']}"
@@ -171,10 +141,14 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         parse_mode="HTML"
     )
 
-    # Уведомление операторов при эскалации
+    # === УВЕДОМЛЕНИЕ ОПЕРАТОРОВ — ТОЛЬКО ПРИ ЭСКАЛАЦИИ ===
     action = ai_result.get("action", "").lower()
     escalation_reason = ai_result.get("escalation_reason") or ""
-    if action == "escalate" or "оператор" in ai_result.get("response_to_user", "").lower():
+    if (
+        action == "escalate"
+        or "оператор" in ai_result.get("response_to_user", "").lower()
+        or "человек" in ai_result.get("response_to_user", "").lower()
+    ):
         admin_tags = " ".join([f"<a href='tg://user?id={a}'>❗</a>" for a in ADMINS])
         reason = escalation_reason or "автоматическая эскалация"
         await bot.send_message(
@@ -184,22 +158,17 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
             parse_mode="HTML"
         )
 
-    # Ответ пользователю — с защитой от пустого текста
+    # Ответ пользователю
     response_parts = []
     if user.get("first_message_in_ticket") and ai_result.get("estimated_time"):
-        notice = await load_text("ticket_notice", time=ai_result["estimated_time"])
-        response_parts.append(notice)
+        response_parts.append(f"ℹ️ Время обработки — до {ai_result['estimated_time']}.")
     response_parts.append(ai_result["response_to_user"])
     final_response = "\n\n".join(filter(None, response_parts))
 
     if not final_response.strip():
         final_response = "Спасибо за информацию. Оператор скоро свяжется с вами."
 
-    # ✅ Отправляем ответ + оставляем клавиатуру «Новая заявка»
-    await message.answer(
-        final_response,
-        reply_markup=await get_new_ticket_button()
-    )
+    await message.answer(final_response)
 
     # Обновляем историю и флаг
     history.append({"from_user": False, "text": final_response, "has_media": False})
