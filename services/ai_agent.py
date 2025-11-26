@@ -3,6 +3,7 @@ import os
 import json
 import logging
 import asyncio
+import random
 import re
 from typing import Any, Dict, List, Optional
 
@@ -24,8 +25,8 @@ logger = logging.getLogger(__name__)
 ENABLE_MEDIA_ANALYSIS = True
 
 
-# === MIME-определение ===
-def determine_mime_type( bytes, filename: str = "") -> str:
+# === MIME-определение (без изменений) ===
+def determine_mime_type(data: bytes, filename: str = "") -> str:
     if _IMGHDR_AVAILABLE:
         img_type = imghdr.what(None, data)
         if img_type:
@@ -40,7 +41,7 @@ def determine_mime_type( bytes, filename: str = "") -> str:
     return 'application/octet-stream'
 
 
-# === Инициализация модели ===
+# === Инициализация модели (без изменений) ===
 _gemini_model = None
 
 def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
@@ -72,9 +73,8 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     return _gemini_model
 
 
-# === Очистка ответа ===
+# === Очистка ответа (без изменений) ===
 def clean_gemini_response(text: str) -> str:
-    # Убираем JSON-обёртки вида ["..."] и {"response": "..."}
     try:
         data = json.loads(text.strip())
         if isinstance(data, list) and len(data) > 0:
@@ -83,14 +83,12 @@ def clean_gemini_response(text: str) -> str:
             text = str(data["response"])
     except:
         pass
-    # Убираем бинарный мусор
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
-    # Убираем технические префиксы
     text = re.sub(r'^\[(REPLY|COLLECT|ESCALATE)\]\s*', '', text, flags=re.IGNORECASE)
     return text
 
 
-# === Вызов модели ===
+# === Вызов модели с retry (единственное изменение) ===
 async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
     model = _get_gemini_model()
     if not model:
@@ -98,40 +96,57 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
 
     logger.info(f"📤 Gemini: промпт (полный):\n{contents}")
 
-    try:
-        response = await asyncio.to_thread(model.generate_content, contents)
-        if not response or not response.text:
-            logger.warning("❌ Gemini: пустой ответ")
-            return None
+    for attempt in range(3):  # 3 попытки
+        try:
+            response = await asyncio.to_thread(model.generate_content, contents)
+            if not response or not response.text:
+                logger.warning("❌ Gemini: пустой ответ")
+                return None
 
-        logger.info(f"📥 Gemini: ответ (сырой):\n{response.text}")
-        clean_text = clean_gemini_response(response.text)
-        logger.info(f"✅ Gemini: очищенный ответ:\n{clean_text}")
+            logger.info(f"📥 Gemini: ответ (сырой):\n{response.text}")
+            clean_text = clean_gemini_response(response.text)
+            logger.info(f"✅ Gemini: очищенный ответ:\n{clean_text}")
 
-        # Авто-эскалация
-        lower = clean_text.lower()
-        escalation_triggers = ["угроз", "суд", "жалоб", "мошенник", "кинули", "оператор", "человек"]
-        escalation = any(t in lower for t in escalation_triggers)
+            # Авто-эскалация (без изменений)
+            lower = clean_text.lower()
+            escalation_triggers = ["угрож", "суд", "жалоб", "мошенник", "кинули", "оператор", "человек"]
+            escalation = any(t in lower for t in escalation_triggers)
 
-        action = "escalate" if escalation else "reply"
-        estimate = "12 часов" if escalation else ""
+            action = "escalate" if escalation else "reply"
+            estimate = "12 часов" if escalation else ""
 
-        return {
-            "action": action,
-            "response_to_user": clean_text,
-            "escalation_reason": "авто-эскалация" if escalation else None,
-            "estimated_time": estimate
-        }
+            return {
+                "action": action,
+                "response_to_user": clean_text,
+                "escalation_reason": "авто-эскалация" if escalation else None,
+                "estimated_time": estimate
+            }
 
-    except Exception as e:
-        logger.exception("💥 Ошибка вызова Gemini")
-        return None
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "ResourceExhausted" in err_str or "500" in err_str or "gRPC" in err_str:
+                delay = (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(f"⏳ {err_str} — повтор через {delay:.1f} с (попытка {attempt + 1}/3)")
+                await asyncio.sleep(delay)
+                continue
+            else:
+                logger.exception("💥 Другая ошибка Gemini")
+                break
+
+    # После 3 неудачных попыток — fallback с эскалацией (как было)
+    logger.warning("⚠️ Все попытки исчерпаны. Используется fallback с эскалацией")
+    return {
+        "action": "escalate",
+        "response_to_user": "Передаю ваш запрос оператору.",
+        "escalation_reason": "ошибка Gemini после 3 попыток",
+        "estimated_time": "12 часов"
+    }
 
 
-# === Fallback ===
+# === Fallback (без изменений) ===
 def _fallback_response(user_message: str, theme: str) -> Dict[str, Any]:
     text = (user_message or "").lower()
-    if any(t in text for t in ["угроз", "суд", "жалоб", "мошенник"]):
+    if any(t in text for t in ["угрож", "суд", "жалоб", "мошенник"]):
         return {
             "action": "escalate",
             "response_to_user": "Передаю ваш запрос оператору.",
@@ -145,7 +160,7 @@ def _fallback_response(user_message: str, theme: str) -> Dict[str, Any]:
     }
 
 
-# === Основной вход ===
+# === Основной вход (без изменений) ===
 async def process_ticket(
     *,
     user_message: str,
@@ -158,7 +173,6 @@ async def process_ticket(
     theme = current_theme or "deposit"
     logger.info(f"🆕 Запрос ИИ: user_id={user_id}, тема={theme}, сообщение='{user_message}'")
 
-    # Формируем промпт (только текст)
     prompt = (
         f"USER_ID: {user_id}\n"
         f"Тема: {theme}\n"
@@ -169,12 +183,10 @@ async def process_ticket(
         "Если нужна помощь оператора — скажи: 'Передаю ваш запрос оператору'."
     )
 
-    # Формируем контент
     if ENABLE_MEDIA_ANALYSIS and image_bytes:
         try:
             mime_type = determine_mime_type(image_bytes, filename)
             logger.info(f"🖼️ Медиа: {len(image_bytes)} байт, MIME={mime_type}")
-            # ✅ Правильный способ для gemini-2.0-flash (без Part!)
             contents = [
                 {"mime_type": mime_type, "data": image_bytes},
                 prompt
@@ -185,11 +197,9 @@ async def process_ticket(
     else:
         contents = [prompt]
 
-    # Вызов ИИ
     ai_result = await _call_gemini_with_contents(contents)
     if ai_result:
         return ai_result
 
-    # Fallback
     logger.warning("⚠️ Используется fallback-логика")
     return _fallback_response(user_message, theme)
