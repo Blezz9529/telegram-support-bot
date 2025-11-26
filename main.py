@@ -1,19 +1,24 @@
-# main.py (финальная, проверенная версия)
+# main.py
 import asyncio
 import logging
 import sys
+import os
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from config import BOT_TOKEN, SUPPORT_GROUP_ID
 
+# Настройка логгера
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# ✅ ПРОСТОЙ И РАБОЧИЙ ВАРИАНТ: без кастомной сессии
+# ✅ Добавляем google в sys.path, если используется локальный __init__.py
+if os.path.exists("google/__init__.py"):
+    sys.path.insert(0, ".")
+
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(
@@ -22,11 +27,13 @@ bot = Bot(
 )
 dp = Dispatcher()
 
+
+# Импорт хэндлеров
 try:
     from handlers import user, admin
     dp.include_router(user.router)
     dp.include_router(admin.router)
-except ImportError as e:
+except Exception as e:
     logger.critical(f"❌ Ошибка импорта handlers: {e}")
     sys.exit(1)
 
@@ -37,32 +44,27 @@ async def on_startup():
         from storages.db import init_db
         await init_db()
         logger.info("✅ База данных готова")
-        
+
         chat = await bot.get_chat(SUPPORT_GROUP_ID)
         logger.info(f"✅ Форум: {chat.title}")
     except Exception as e:
-        logger.critical(f"❌ Ошибка: {e}")
+        logger.critical(f"❌ Ошибка инициализации: {e}")
         sys.exit(1)
 
 
 async def main():
     await on_startup()
-    logger.info("📡 Бот запущен...")
+    logger.info("📡 Бот запущен и ожидает сообщений...")
     try:
-        # ✅ НАСТРОЙКА ТАЙМАУТОВ В start_polling()
         await dp.start_polling(
             bot,
             allowed_updates=["message", "callback_query"],
-            # Защита от Flood Control:
-            polling_timeout=30,  # таймаут опроса
-            handle_asynchronously=True,  # асинхронная обработка
-            # Ключевое: request_timeout передаётся отдельно
-            bot_request_timeout=30.0  # ← РАБОЧИЙ ПАРАМЕТР
+            close_bot_session=True
         )
     except KeyboardInterrupt:
-        logger.info("🛑 Остановка")
+        logger.info("🛑 Получен сигнал завершения")
     except Exception as e:
-        logger.exception(f"💥 Ошибка: {e}")
+        logger.exception(f"💥 Критическая ошибка: {e}")
         sys.exit(1)
 
 
