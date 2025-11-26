@@ -82,7 +82,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
             image_bytes = image_bytes.getvalue()
         filename = message.document.file_name or ""
 
-    # Добавляем в историю
+    # Готовим запись сообщения
     new_msg = {
         "from_user": True,
         "text": message.text or message.caption or "",
@@ -94,10 +94,19 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         history = history[-10:]
     await state.update_data(conversation_history=history)
 
-    # Вызов ИИ
+    # 🔑 ПОДГОТОВКА ИСТОРИИ ДЛЯ ИИ: замена байтов на [ИЗОБРАЖЕНИЕ]
+    # Это экономит токены и избегает лимитов
+    history_for_ai = []
+    for msg in history:
+        clean_msg = msg.copy()
+        if msg.get("has_media"):
+            clean_msg["text"] = "[ИЗОБРАЖЕНИЕ]"
+        history_for_ai.append(clean_msg)
+
+    # Вызов ИИ (остальное без изменений)
     ai_result = await process_ticket(
         user_message=new_msg["text"],
-        history=history,
+        history=history_for_ai,  # ← теперь безопасная история
         current_theme=current_theme,
         user_id=message.from_user.id,
         image_bytes=image_bytes,

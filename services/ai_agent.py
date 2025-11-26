@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 ENABLE_MEDIA_ANALYSIS = True
 
 
-# === MIME-определение (без изменений) ===
-def determine_mime_type(data: bytes, filename: str = "") -> str:
+# === MIME-определение ===
+def determine_mime_type( bytes, filename: str = "") -> str:
     if _IMGHDR_AVAILABLE:
         img_type = imghdr.what(None, data)
         if img_type:
@@ -41,7 +41,7 @@ def determine_mime_type(data: bytes, filename: str = "") -> str:
     return 'application/octet-stream'
 
 
-# === Инициализация модели (без изменений) ===
+# === Инициализация модели ===
 _gemini_model = None
 
 def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
@@ -73,7 +73,7 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     return _gemini_model
 
 
-# === Очистка ответа (без изменений) ===
+# === Очистка ответа ===
 def clean_gemini_response(text: str) -> str:
     try:
         data = json.loads(text.strip())
@@ -88,7 +88,7 @@ def clean_gemini_response(text: str) -> str:
     return text
 
 
-# === Вызов модели с retry (единственное изменение) ===
+# === Вызов модели с retry ===
 async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
     model = _get_gemini_model()
     if not model:
@@ -96,7 +96,7 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
 
     logger.info(f"📤 Gemini: промпт (полный):\n{contents}")
 
-    for attempt in range(3):  # 3 попытки
+    for attempt in range(3):
         try:
             response = await asyncio.to_thread(model.generate_content, contents)
             if not response or not response.text:
@@ -107,7 +107,6 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
             clean_text = clean_gemini_response(response.text)
             logger.info(f"✅ Gemini: очищенный ответ:\n{clean_text}")
 
-            # Авто-эскалация (без изменений)
             lower = clean_text.lower()
             escalation_triggers = ["угрож", "суд", "жалоб", "мошенник", "кинули", "оператор", "человек"]
             escalation = any(t in lower for t in escalation_triggers)
@@ -133,7 +132,6 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
                 logger.exception("💥 Другая ошибка Gemini")
                 break
 
-    # После 3 неудачных попыток — fallback с эскалацией (как было)
     logger.warning("⚠️ Все попытки исчерпаны. Используется fallback с эскалацией")
     return {
         "action": "escalate",
@@ -143,7 +141,7 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
     }
 
 
-# === Fallback (без изменений) ===
+# === Fallback ===
 def _fallback_response(user_message: str, theme: str) -> Dict[str, Any]:
     text = (user_message or "").lower()
     if any(t in text for t in ["угрож", "суд", "жалоб", "мошенник"]):
@@ -160,7 +158,7 @@ def _fallback_response(user_message: str, theme: str) -> Dict[str, Any]:
     }
 
 
-# === Основной вход (без изменений) ===
+# === Основной вход ===
 async def process_ticket(
     *,
     user_message: str,
@@ -173,16 +171,18 @@ async def process_ticket(
     theme = current_theme or "deposit"
     logger.info(f"🆕 Запрос ИИ: user_id={user_id}, тема={theme}, сообщение='{user_message}'")
 
+    # Формируем промпт (без media в истории — уже заменено на [ИЗОБРАЖЕНИЕ])
     prompt = (
         f"USER_ID: {user_id}\n"
         f"Тема: {theme}\n"
-        f"История: {history[-3:]}\n"
+        f"История: {history}\n"
         f"Сообщение: {user_message}\n"
         "---\n"
         "Ответь кратко и вежливо на русском. Если нужны документы — попроси конкретно. "
         "Если нужна помощь оператора — скажи: 'Передаю ваш запрос оператору'."
     )
 
+    # Подготавливаем контент
     if ENABLE_MEDIA_ANALYSIS and image_bytes:
         try:
             mime_type = determine_mime_type(image_bytes, filename)
