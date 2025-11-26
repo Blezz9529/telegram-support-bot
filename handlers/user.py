@@ -5,7 +5,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from config import SUPPORT_GROUP_ID, ADMINS
 from storages.db import get_user, create_user, update_user
-from services.localization import load_text
 from services.ai_agent import process_ticket
 from services.forum import send_to_topic, get_or_create_topic
 from keyboards.reply import get_main_menu
@@ -35,46 +34,36 @@ async def cmd_start(message: Message, state: FSMContext):
     await create_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
     user = await get_user(message.from_user.id)
     if user and user["is_blocked"]:
-        await message.answer(await load_text("blocked"))
+        await message.answer("❌ Вы заблокированы.")
         return
 
     await state.set_data({"conversation_history": []})
     await state.set_state(SupportStates.choosing_theme)
-
-    await message.answer(
-        await load_text("start_message"),
-        reply_markup=await get_main_menu()
-    )
+    await message.answer("Выберите тему:", reply_markup=await get_main_menu())
 
 
 @router.message(SupportStates.choosing_theme, F.text)
 async def theme_chosen(message: Message, state: FSMContext):
-    theme_text = message.text
-    theme_key = THEME_MAP.get(theme_text)
+    theme_key = THEME_MAP.get(message.text)
     if not theme_key:
         await message.answer("Пожалуйста, выберите тему из меню.")
         return
 
     await update_user(message.from_user.id, first_message_in_ticket=1, theme=theme_key)
-    await state.update_data({
-        "theme": theme_key,
-        "theme_name": theme_text,
-        "conversation_history": []
-    })
+    await state.update_data({"theme": theme_key, "conversation_history": []})
     await state.set_state(SupportStates.in_conversation)
-    await message.answer(await load_text("ask_details"))
+    await message.answer("Опишите проблему.")
 
 
-@router.message(SupportStates.in_conversation, F.text | F.photo | F.document | F.video)
+@router.message(SupportStates.in_conversation, F.text | F.photo | F.document)
 async def handle_message_in_conversation(message: Message, state: FSMContext, bot: Bot):
     user = await get_user(message.from_user.id)
     if not user or user["is_blocked"]:
-        await message.answer(await load_text("blocked"))
+        await message.answer("❌ Вы заблокированы.")
         return
 
     data = await state.get_data()
     current_theme = data.get("theme")
-    theme_name = data.get("theme_name", "Неизвестно")
     history = data.get("conversation_history", [])
 
     # Скачиваем медиа
@@ -106,99 +95,73 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
     await state.update_data(conversation_history=history)
 
     # Вызов ИИ
-    try:
-        ai_result = await process_ticket(
-            user_message=new_msg["text"],
-            history=history,
-            current_theme=current_theme,
-            user_id=message.from_user.id,
-            image_bytes=image_bytes,
-            filename=filename
-        )
-    except Exception as e:
-        logger.exception("❌ Ошибка в process_ticket — fallback")
-        ai_result = {
-            "action": "escalate",
-            "response_to_user": "Извините, произошла ошибка. Запрос передан оператору.",
-            "detected_theme": current_theme,
-            "data_collected": {},
-            "missing_data": [],
-            "escalation_reason": "internal_error",
-            "estimated_time": "12 часов"
-        }
+    ai_result = await process_ticket(
+        user_message=new_msg["text"],
+        history=history,
+        current_theme=current_theme,
+        user_id=message.from_user.id,
+        image_bytes=image_bytes,
+        filename=filename
+    )
 
-    # Обновление темы
-    detected_theme = ai_result.get("detected_theme")
-    if detected_theme and detected_theme != current_theme:
-        theme_name = next((k for k, v in THEME_MAP.items() if v == detected_theme), "Другой вопрос")
-        await state.update_data(theme=detected_theme, theme_name=theme_name)
-        await update_user(message.from_user.id, theme=detected_theme)
-        current_theme = detected_theme
+    # Обновляем тему при необходимости
+    if ai_result.get("detected_theme"):
+        await state.update_data(theme=ai_result["detected_theme"])
+        await update_user(message.from_user.id, theme=ai_result["detected_theme"])
 
     # Получаем/создаём топик
     topic_id = await get_or_create_topic(
-        bot, user["user_id"], user["username"], user["full_name"], theme_name
+        bot, user["user_id"], user["username"], user["full_name"], current_theme or "Другой вопрос"
     )
 
     # Пересылаем сообщение
-    await send_to_topic(bot, user, message, theme_name)
+    await send_to_topic(bot, user, message, current_theme or "Другой вопрос")
 
-    # Формируем полный ответ ИИ для топика
-    ai_response_text = ai_result["response_to_user"].strip()
-    if ai_result.get("missing_data"):
-        ai_response_text += "\n\n❓ Запрошены: " + ", ".join(ai_result["missing_data"])
+    # === ФОРМИРУЕМ ОТВЕТ В ТОПИК ===
+    ai_text = ai_result["response_to_user"].strip()
     if ai_result.get("escalation_reason"):
-        ai_response_text += "\n\n🔴 Причина эскалации: " + ai_result["escalation_reason"]
+        ai_text += f"\n\n🔴 Причина эскалации: {ai_result['escalation_reason']}"
     if ai_result.get("estimated_time"):
-        ai_response_text += f"\n\n⏱ Время обработки: {ai_result['estimated_time']}"
-
-    ai_log = (
-        f"🧠 <b>ИИ (gemini-2.0-flash)</b>\n"
-        f"• Действие: <code>{ai_result['action']}</code>\n"
-        f"• Тема: <code>{current_theme}</code>\n"
-        f"──────────────────\n"
-        f"{ai_response_text}"
-    )
+        ai_text += f"\n\n⏱ Время обработки: {ai_result['estimated_time']}"
 
     await bot.send_message(
         chat_id=SUPPORT_GROUP_ID,
         message_thread_id=topic_id,
-        text=ai_log,
+        text=f"🧠 <b>ИИ</b>\n{ai_text}",
         parse_mode="HTML"
     )
 
-    # Уведомление админов — ТОЛЬКО при эскалации
-    if ai_result.get("action") == "escalate" and ai_result.get("escalation_reason"):
+    # === УВЕДОМЛЕНИЕ ОПЕРАТОРОВ — ТОЛЬКО ПРИ ЭСКАЛАЦИИ ===
+    action = ai_result.get("action", "").lower()
+    escalation_reason = ai_result.get("escalation_reason") or ""
+    if (
+        action == "escalate" or
+        "оператор" in ai_result.get("response_to_user", "").lower() or
+        "человек" in ai_result.get("response_to_user", "").lower()
+    ):
         admin_tags = " ".join([f"<a href='tg://user?id={a}'>❗</a>" for a in ADMINS])
+        reason = escalation_reason or "автоматическая эскалация"
         await bot.send_message(
             chat_id=SUPPORT_GROUP_ID,
             message_thread_id=topic_id,
-            text=f"{admin_tags} <b>❗ ТРЕБУЕТСЯ ДЕЙСТВИЕ:</b>\n{ai_result['escalation_reason']}",
+            text=f"{admin_tags} <b>❗ УВЕДОМЛЕНИЕ ОПЕРАТОРА</b>\n{reason}",
             parse_mode="HTML"
         )
 
-    # Ответ пользователю — с защитой от пустого текста
+    # Ответ пользователю
     response_parts = []
     if user.get("first_message_in_ticket") and ai_result.get("estimated_time"):
-        notice = await load_text("ticket_notice", time=ai_result["estimated_time"])
-        response_parts.append(notice)
+        response_parts.append(f"ℹ️ Время обработки — до {ai_result['estimated_time']}.")
     response_parts.append(ai_result["response_to_user"])
-
     final_response = "\n\n".join(filter(None, response_parts))
+
     if not final_response.strip():
-        final_response = "Спасибо за обращение. Оператор скоро свяжется с вами."
+        final_response = "Спасибо за информацию. Оператор скоро свяжется с вами."
 
     await message.answer(final_response)
 
-    # Обновляем историю
-    history.append({
-        "from_user": False,
-        "text": final_response,
-        "has_media": False,
-        "timestamp": message.date.isoformat()
-    })
+    # Обновляем историю и флаг
+    history.append({"from_user": False, "text": final_response, "has_media": False})
     await state.update_data(conversation_history=history[-10:])
-
-    # Сбрасываем флаг первого сообщения
     if user.get("first_message_in_ticket"):
         await update_user(message.from_user.id, first_message_in_ticket=0)

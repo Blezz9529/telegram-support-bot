@@ -3,9 +3,9 @@ import os
 import json
 import logging
 import asyncio
+import re
 from typing import Any, Dict, List, Optional
 
-# === Импорты Google AI (без Part) ===
 try:
     import google.generativeai as genai
     from google.generativeai.types import GenerationConfig
@@ -24,8 +24,8 @@ logger = logging.getLogger(__name__)
 ENABLE_MEDIA_ANALYSIS = True
 
 
-# === Автоопределение MIME-типа ===
-def determine_mime_type(data: bytes, filename: str = "") -> str:
+# === Автоопределение MIME ===
+def determine_mime_type( bytes, filename: str = "") -> str:
     if _IMGHDR_AVAILABLE:
         img_type = imghdr.what(None, data)
         if img_type:
@@ -62,7 +62,12 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
                     max_output_tokens=768,
                     response_mime_type="application/json"
                 ),
-                system_instruction="Ты — ИИ-агент поддержки. Отвечай ТОЛЬКО в формате: [REPLY|COLLECT|ESCALATE] Текст..."
+                system_instruction=(
+                    "Ты — вежливый и компетентный ИИ-агент поддержки. "
+                    "Отвечай кратко, по-русски, только по сути. "
+                    "Если нужны документы — попроси конкретно: 'Пожалуйста, пришлите...'. "
+                    "Если нужна помощь оператора — скажи: 'Передаю ваш запрос оператору' и вызови эскалацию."
+                )
             )
             _gemini_model.generate_content("OK", generation_config={"max_output_tokens": 1})
             logger.info("✅ Gemini: модель gemini-2.0-flash инициализирована")
@@ -72,64 +77,41 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     return _gemini_model
 
 
-# === Парсинг ответа по префиксам ===
-def parse_gemini_response(raw_text: str) -> Dict[str, Any]:
-    text = raw_text.strip()
-    if text.startswith("[ESCALATE]"):
-        reason = text.split(":", 1)[-1].strip() if ":" in text else "эскалация по префиксу"
+# === Очистка текста от мусора ===
+def clean_gemini_response(text: str) -> str:
+    # Убираем JSON-обёртку вида ["..."] или {"response": "..."}
+    try:
+        data = json.loads(text.strip())
+        if isinstance(data, list) and len(data) > 0:
+            text = str(data[0])
+        elif isinstance(data, dict) and "response" in data:
+            text = str(data["response"])
+    except:
+        pass
+
+    # Убираем бинарный мусор и непечатаемые символы
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
+
+    # Убираем технические префиксы, оставляя только содержание
+    text = re.sub(r'^\[(REPLY|COLLECT|ESCALATE)\]\s*', '', text, flags=re.IGNORECASE)
+
+    return text
+
+
+# === Парсинг действия по ключевым словам ===
+def parse_action(text: str) -> Dict[str, Any]:
+    lower = text.lower()
+    escalation_triggers = ["угроз", "суд", "жалоб", "мошенник", "кинули", "оператор", "человек", "живой"]
+    
+    if any(t in lower for t in escalation_triggers):
         return {
             "action": "escalate",
-            "response_to_user": text.replace("[ESCALATE]", "", 1).strip(),
-            "escalation_reason": reason,
-            "estimated_time": "12 часов"
+            "escalation_reason": "авто-эскалация по ключевым словам"
         }
-    elif text.startswith("[COLLECT]"):
-        return {
-            "action": "collect_data",
-            "response_to_user": text.replace("[COLLECT]", "", 1).strip(),
-            "missing_data": ["документы"],
-            "estimated_time": "2 часа"
-        }
-    else:
-        return {
-            "action": "reply",
-            "response_to_user": text,
-            "estimated_time": ""
-        }
+    return {"action": "reply"}
 
 
-# === Построение промпта (без JSON-схемы) ===
-def _build_prompt(
-    user_message: str,
-    history: List[Dict[str, Any]],
-    theme: str,
-    user_id: int,
-    has_media: bool = False
-) -> str:
-    history_preview = "\n".join([
-        f"{'👤' if h.get('from_user') else '🤖'}: {h.get('text', '')}"
-        for h in history[-5:]
-    ])
-    return f"""[КОНТЕКСТ]
-USER_ID: {user_id}
-Тема: {theme}
-
-[ИНСТРУКЦИЯ]
-— Ответ должен начинаться с одного из префиксов:
-  [REPLY] — обычная информация
-  [COLLECT] — нужны документы
-  [ESCALATE] — эскалация (угрозы, жалобы, мошенничество)
-— После префикса — только текст, никаких JSON, markdown.
-— Если есть медиа — проанализируй его и ответь по сути.
-
-[ИСТОРИЯ]
-{history_preview}
-
-[НОВОЕ СООБЩЕНИЕ]
-{user_message}"""
-
-
-# === Вызов модели с корректной передачей медиа ===
+# === Вызов модели ===
 async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
     model = _get_gemini_model()
     if not model:
@@ -143,8 +125,20 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
             logger.warning("❌ Gemini: пустой ответ")
             return None
 
-        logger.info(f"📥 Gemini: ответ (полный):\n{response.text}")
-        return parse_gemini_response(response.text)
+        logger.info(f"📥 Gemini: сырой ответ:\n{response.text}")
+
+        # Очистка и парсинг
+        clean_text = clean_gemini_response(response.text)
+        action_data = parse_action(clean_text)
+
+        logger.info(f"✅ Gemini: очищенный ответ: {clean_text}")
+
+        return {
+            "action": action_data["action"],
+            "response_to_user": clean_text,
+            "escalation_reason": action_data.get("escalation_reason"),
+            "estimated_time": "12 часов" if action_data["action"] == "escalate" else ""
+        }
 
     except Exception as e:
         logger.exception("💥 Ошибка вызова Gemini")
@@ -157,25 +151,18 @@ def _fallback_response(user_message: str, theme: str) -> Dict[str, Any]:
     if any(t in text for t in ["угроз", "суд", "жалоб", "мошенник"]):
         return {
             "action": "escalate",
-            "response_to_user": "Ваш запрос передан оператору.",
+            "response_to_user": "Передаю ваш запрос оператору.",
             "escalation_reason": "триггер в сообщении",
             "estimated_time": "12 часов"
         }
-    if theme == "deposit":
-        return {
-            "action": "collect_data",
-            "response_to_user": "Пожалуйста, пришлите любые документы, подтверждающие ваш запрос.",
-            "missing_data": ["Любые доказательства"],
-            "estimated_time": "2 часа"
-        }
     return {
         "action": "reply",
-        "response_to_user": "Спасибо за информацию! Оператор свяжется при необходимости.",
+        "response_to_user": "Спасибо за обращение. Оператор скоро свяжется с вами.",
         "estimated_time": ""
     }
 
 
-# === ОСНОВНОЙ ВХОД ===
+# === Основной вход ===
 async def process_ticket(
     *,
     user_message: str,
@@ -185,22 +172,26 @@ async def process_ticket(
     image_bytes: Optional[bytes] = None,
     filename: str = ""
 ) -> Dict[str, Any]:
-    theme = current_theme or "default"
+    theme = current_theme or "deposit"
     logger.info(f"🆕 Запрос ИИ: user_id={user_id}, тема={theme}, сообщение='{user_message}'")
 
-    # Формируем промпт
-    prompt = _build_prompt(user_message, history, theme, user_id, bool(image_bytes))
+    # Формируем промпт (без JSON-схемы)
+    prompt = (
+        f"USER_ID: {user_id}\n"
+        f"Тема: {theme}\n"
+        f"История: {history[-3:]}\n"
+        f"Сообщение: {user_message}\n"
+        "---\n"
+        "Ответь кратко и вежливо на русском. Если нужны документы — попроси конкретно. "
+        "Если нужна помощь оператора — скажи: 'Передаю ваш запрос оператору'."
+    )
 
-    # Подготавливаем контент
+    # Формируем контент
     if ENABLE_MEDIA_ANALYSIS and image_bytes:
         try:
             mime_type = determine_mime_type(image_bytes, filename)
             logger.info(f"🖼️ Медиа: {len(image_bytes)} байт, MIME={mime_type}")
-            # ✅ Правильный способ для gemini-2.0-flash (без Part!)
-            image_part = {
-                "mime_type": mime_type,
-                "data": image_bytes
-            }
+            image_part = {"mime_type": mime_type, "data": image_bytes}
             contents = [image_part, prompt]
         except Exception as e:
             logger.error(f"❌ Ошибка подготовки медиа: {e}")
