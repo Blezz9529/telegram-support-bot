@@ -82,14 +82,16 @@ def clean_gemini_response(text: str) -> tuple[str, bool]:
     """
     Возвращает (очищенный_текст, эскалация_нужна)
     """
+    # Пробуем распарсить JSON
     try:
         data = json.loads(text.strip())
         if isinstance(data, list) and len(data) > 0:
             text = str(data[0])
         elif isinstance(data, dict) and "response" in 
             text = str(data["response"])
-    except:
-        pass
+    except json.JSONDecodeError:
+        pass  # оставляем как есть
+
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
 
     escalation = text.startswith("[OPERATOR]")
