@@ -108,7 +108,7 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
             logger.info(f"✅ Gemini: очищенный ответ:\n{clean_text}")
 
             lower = clean_text.lower()
-            escalation_triggers = ["угрож", "суд", "жалоб", "мошенник", "кинули", "оператор", "человек"]
+            escalation_triggers = ["угроз", "суд", "жалоб", "мошенник", "кинули", "оператор", "человек"]
             escalation = any(t in lower for t in escalation_triggers)
 
             action = "escalate" if escalation else "reply"
@@ -144,7 +144,7 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
 # === Fallback ===
 def _fallback_response(user_message: str, theme: str) -> Dict[str, Any]:
     text = (user_message or "").lower()
-    if any(t in text for t in ["угрож", "суд", "жалоб", "мошенник"]):
+    if any(t in text for t in ["угроз", "суд", "жалоб", "мошенник"]):
         return {
             "action": "escalate",
             "response_to_user": "Передаю ваш запрос оператору.",
@@ -158,11 +158,11 @@ def _fallback_response(user_message: str, theme: str) -> Dict[str, Any]:
     }
 
 
-# === Основной вход ===
+# === Основной вход (исправлен: убрано дублирование текущего сообщения в history) ===
 async def process_ticket(
     *,
-    user_message: str,
-    history: List[Dict[str, Any]],
+    user_message: str,  # ← текущее сообщение (не входит в history)
+    history: List[Dict[str, Any]],  # ← только предыдущие сообщения
     current_theme: Optional[str] = None,
     user_id: int,
     image_bytes: Optional[bytes] = None,
@@ -171,12 +171,12 @@ async def process_ticket(
     theme = current_theme or "deposit"
     logger.info(f"🆕 Запрос ИИ: user_id={user_id}, тема={theme}, сообщение='{user_message}'")
 
-    # Формируем промпт (без media в истории — уже заменено на [ИЗОБРАЖЕНИЕ])
+    # Формируем промпт: только история + текущее сообщение (отдельно)
     prompt = (
         f"USER_ID: {user_id}\n"
         f"Тема: {theme}\n"
-        f"История: {history}\n"
-        f"Сообщение: {user_message}\n"
+        f"История: {history}\n"  # ← без текущего сообщения
+        f"Сообщение: {user_message}\n"  # ← текущее сообщение отдельно
         "---\n"
         "Ответь кратко и вежливо на русском. Если нужны документы — попроси конкретно. "
         "Если нужна помощь оператора — скажи: 'Передаю ваш запрос оператору'."
