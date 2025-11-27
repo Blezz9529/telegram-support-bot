@@ -77,7 +77,7 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     return _gemini_model
 
 
-# === Очистка ответа ===
+# === Очистка ответа (исправленная версия — без синтаксиса) ===
 def clean_gemini_response(text: str) -> tuple[str, bool]:
     """
     Возвращает (очищенный_текст, эскалация_нужна)
@@ -87,11 +87,12 @@ def clean_gemini_response(text: str) -> tuple[str, bool]:
         data = json.loads(text.strip())
         if isinstance(data, list) and len(data) > 0:
             text = str(data[0])
-        elif isinstance(data, dict) and "response" in 
+        elif isinstance(data, dict) and "response" in data:  # ✅ ИСПРАВЛЕНО: добавлено "and data"
             text = str(data["response"])
     except json.JSONDecodeError:
         pass  # оставляем как есть
 
+    # Убираем бинарный мусор
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
 
     escalation = text.startswith("[OPERATOR]")
