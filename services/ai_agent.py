@@ -63,7 +63,11 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
                     max_output_tokens=768,
                     response_mime_type="application/json"
                 ),
-                system_instruction="Ты — вежливый ИИ-агент поддержки. Отвечай на русском, кратко, по делу."
+                system_instruction=(
+                    "Ты — вежливый ИИ-агент поддержки. "
+                    "Отвечай на русском, кратко, по делу. "
+                    "Если нужна помощь оператора — начни ответ с ключевого слова [OPERATOR]."
+                )
             )
             _gemini_model.generate_content("OK", generation_config={"max_output_tokens": 1})
             logger.info("✅ Gemini: модель gemini-2.0-flash инициализирована")
@@ -74,18 +78,24 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
 
 
 # === Очистка ответа ===
-def clean_gemini_response(text: str) -> str:
+def clean_gemini_response(text: str) -> tuple[str, bool]:
+    """
+    Возвращает (очищенный_текст, эскалация_нужна)
+    """
     try:
         data = json.loads(text.strip())
         if isinstance(data, list) and len(data) > 0:
             text = str(data[0])
-        elif isinstance(data, dict) and "response" in data:
+        elif isinstance(data, dict) and "response" in 
             text = str(data["response"])
     except:
         pass
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
-    text = re.sub(r'^\[(REPLY|COLLECT|ESCALATE)\]\s*', '', text, flags=re.IGNORECASE)
-    return text
+
+    escalation = text.startswith("[OPERATOR]")
+    if escalation:
+        text = text.replace("[OPERATOR]", "", 1).strip()
+    return text, escalation
 
 
 # === Вызов модели с retry ===
@@ -104,20 +114,16 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
                 return None
 
             logger.info(f"📥 Gemini: ответ (сырой):\n{response.text}")
-            clean_text = clean_gemini_response(response.text)
-            logger.info(f"✅ Gemini: очищенный ответ:\n{clean_text}")
+            clean_text, needs_escalation = clean_gemini_response(response.text)
+            logger.info(f"✅ Gemini: очищенный ответ: {clean_text}, эскалация: {needs_escalation}")
 
-            lower = clean_text.lower()
-            escalation_triggers = ["угроз", "суд", "жалоб", "мошенник", "кинули", "оператор", "человек"]
-            escalation = any(t in lower for t in escalation_triggers)
-
-            action = "escalate" if escalation else "reply"
-            estimate = "12 часов" if escalation else ""
+            action = "escalate" if needs_escalation else "reply"
+            estimate = "12 часов" if needs_escalation else ""
 
             return {
                 "action": action,
                 "response_to_user": clean_text,
-                "escalation_reason": "авто-эскалация" if escalation else None,
+                "escalation_reason": "нужна помощь оператора" if needs_escalation else None,
                 "estimated_time": estimate
             }
 
@@ -158,11 +164,11 @@ def _fallback_response(user_message: str, theme: str) -> Dict[str, Any]:
     }
 
 
-# === Основной вход (исправлен: убрано дублирование текущего сообщения в history) ===
+# === Основной вход ===
 async def process_ticket(
     *,
-    user_message: str,  # ← текущее сообщение (не входит в history)
-    history: List[Dict[str, Any]],  # ← только предыдущие сообщения
+    user_message: str,
+    history: List[Dict[str, Any]],
     current_theme: Optional[str] = None,
     user_id: int,
     image_bytes: Optional[bytes] = None,
@@ -171,18 +177,16 @@ async def process_ticket(
     theme = current_theme or "deposit"
     logger.info(f"🆕 Запрос ИИ: user_id={user_id}, тема={theme}, сообщение='{user_message}'")
 
-    # Формируем промпт: только история + текущее сообщение (отдельно)
     prompt = (
         f"USER_ID: {user_id}\n"
         f"Тема: {theme}\n"
-        f"История: {history}\n"  # ← без текущего сообщения
-        f"Сообщение: {user_message}\n"  # ← текущее сообщение отдельно
+        f"История: {history}\n"
+        f"Сообщение: {user_message}\n"
         "---\n"
         "Ответь кратко и вежливо на русском. Если нужны документы — попроси конкретно. "
-        "Если нужна помощь оператора — скажи: 'Передаю ваш запрос оператору'."
+        "Если нужна помощь оператора — начни ответ с ключевого слова [OPERATOR]."
     )
 
-    # Подготавливаем контент
     if ENABLE_MEDIA_ANALYSIS and image_bytes:
         try:
             mime_type = determine_mime_type(image_bytes, filename)
