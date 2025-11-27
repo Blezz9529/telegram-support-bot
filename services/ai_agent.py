@@ -82,24 +82,26 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     return _gemini_model
 
 
-# === Очистка ответа ===
+# === Очистка ответа — исправлено (удаляет [OPERATOR] из любого места) ===
 def clean_gemini_response(text: str) -> tuple[str, bool]:
     """
     Возвращает (очищенный_текст, эскалация_нужна)
     """
+    # Пробуем распарсить JSON
     try:
         data = json.loads(text.strip())
         if isinstance(data, list) and len(data) > 0:
             text = str(data[0])
-        elif isinstance(data, dict) and "response" in data:
+        elif isinstance(data, dict) and "response" in 
             text = str(data["response"])
     except json.JSONDecodeError:
         pass  # оставляем как есть
+
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
 
-    escalation = text.startswith("[OPERATOR]")
-    if escalation:
-        text = text.replace("[OPERATOR]", "", 1).strip()
+    # 🔑 ИСПРАВЛЕНО: ищем [OPERATOR] в любом месте текста, а не только в начале
+    escalation = "[OPERATOR]" in text
+    text = text.replace("[OPERATOR]", "").strip()
     return text, escalation
 
 
@@ -111,10 +113,10 @@ async def prepare_history_for_prompt(
     """
     Возвращает историю, где:
     - Первое появление изображения: передаётся как байты (если есть)
-    - Последующие: заменяются на текстовое описание
+    - Последующие: заменяются на текстовое описание (summary)
     """
     prepared = []
-    seen_images = set()  # (timestamp,)
+    seen_images = set()  # (user_id, timestamp,)
     for msg in original_history:
         if msg.get("has_media") and msg.get("from_user"):
             timestamp = msg.get("timestamp", "unknown")
@@ -129,7 +131,7 @@ async def prepare_history_for_prompt(
                     "timestamp": timestamp
                 })
             else:
-                # Первый раз — оставляем как есть
+                # Первый раз — оставляем как есть (байты передаются отдельно)
                 prepared.append(msg)
                 seen_images.add(img_key)
         else:
@@ -182,12 +184,13 @@ async def analyze_and_cache_image(
     return summary
 
 
-# === Вызов модели с retry ===
+# === Вызов модели с retry и логированием ===
 async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
     model = _get_gemini_model()
     if not model:
         return None
 
+    # 🔑 ЛОГИРУЕМ ВХОД (без обрезки)
     logger.info(f"📤 Gemini: промпт (полный):\n{contents}")
 
     for attempt in range(3):
@@ -197,6 +200,7 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
                 logger.warning("❌ Gemini: пустой ответ")
                 return None
 
+            # 🔑 ЛОГИРУЕМ ОТВЕТ (без обрезки)
             logger.info(f"📥 Gemini: ответ (сырой):\n{response.text}")
             clean_text, needs_escalation = clean_gemini_response(response.text)
             logger.info(f"✅ Gemini: очищенный ответ: {clean_text}, эскалация: {needs_escalation}")
@@ -251,8 +255,8 @@ def _fallback_response(user_message: str, theme: str) -> Dict[str, Any]:
 # === Основной вход ===
 async def process_ticket(
     *,
-    user_message: str,
-    history: List[Dict[str, Any]],
+    user_message: str,          # ← текущее сообщение (не входит в history)
+    history: List[Dict[str, Any]],  # ← только прошлые сообщения (без текущего)
     current_theme: Optional[str] = None,
     user_id: int,
     image_bytes: Optional[bytes] = None,
@@ -264,6 +268,7 @@ async def process_ticket(
     # 🔑 Подготовка истории: изображения → summary
     prepared_history = await prepare_history_for_prompt(history, user_id)
 
+    # Формируем промпт: только история + текущее сообщение отдельно
     prompt = (
         f"USER_ID: {user_id}\n"
         f"Тема: {theme}\n"
