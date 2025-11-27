@@ -25,7 +25,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 ENABLE_MEDIA_ANALYSIS = True
 
-# 🔑 Кэш описаний изображений (хранит summary по (user_id, timestamp))
+# === Кэш описаний изображений (user_id, timestamp) → summary ===
 _image_summaries = {}
 _cache_lock = Lock()
 
@@ -84,30 +84,68 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
 
 # === Очистка ответа ===
 def clean_gemini_response(text: str) -> tuple[str, bool]:
+    """
+    Возвращает (очищенный_текст, эскалация_нужна)
+    """
     try:
         data = json.loads(text.strip())
         if isinstance(data, list) and len(data) > 0:
             text = str(data[0])
-        elif isinstance(data, dict) and "response" in 
+        elif isinstance(data, dict) and "response" in data:
             text = str(data["response"])
-    except:
-        pass
+    except json.JSONDecodeError:
+        pass  # оставляем как есть
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
+
     escalation = text.startswith("[OPERATOR]")
     if escalation:
         text = text.replace("[OPERATOR]", "", 1).strip()
     return text, escalation
 
 
-# === АНАЛИЗ ИЗОБРАЖЕНИЯ (с сохранением описания) ===
+# === Подготовка истории: изображения → summary ===
+async def prepare_history_for_prompt(
+    original_history: List[Dict[str, Any]],
+    user_id: int
+) -> List[Dict[str, Any]]:
+    """
+    Возвращает историю, где:
+    - Первое появление изображения: передаётся как байты (если есть)
+    - Последующие: заменяются на текстовое описание
+    """
+    prepared = []
+    seen_images = set()  # (timestamp,)
+    for msg in original_history:
+        if msg.get("has_media") and msg.get("from_user"):
+            timestamp = msg.get("timestamp", "unknown")
+            img_key = (user_id, timestamp)
+            if img_key in seen_images:
+                # Уже видели — заменяем на summary
+                summary = _image_summaries.get(img_key, "[Изображение: описание недоступно]")
+                prepared.append({
+                    "from_user": True,
+                    "text": f"[ИЗОБРАЖЕНИЕ]\n{summary}",
+                    "has_media": False,
+                    "timestamp": timestamp
+                })
+            else:
+                # Первый раз — оставляем как есть
+                prepared.append(msg)
+                seen_images.add(img_key)
+        else:
+            prepared.append(msg)
+    return prepared
+
+
+# === Анализ изображения и кэширование ===
 async def analyze_and_cache_image(
     image_bytes: bytes,
     user_id: int,
     timestamp: str
 ) -> str:
     """
-    Анализирует изображение и возвращает его текстовое описание.
-    Кэширует результат по (user_id, timestamp) → не вызывает Gemini дважды.
+    Возвращает текстовое описание изображения.
+    Кэширует результат по (user_id, timestamp).
     """
     cache_key = (user_id, timestamp)
     with _cache_lock:
@@ -117,70 +155,31 @@ async def analyze_and_cache_image(
 
     model = _get_gemini_model()
     if not model:
-        return "[Изображение: не удалось проанализировать]"
-
-    prompt = (
-        "Опиши изображение кратко и по делу. Укажи: "
-        "1. Что на изображении (чек, счёт, реквизиты и т.п.) "
-        "2. Ключевые данные (сумма, дата, реквизиты, логотип и т.д.) "
-        "3. Есть ли признаки ошибки/мошенничества. "
-        "Ответь на русском, в 2-3 предложениях."
-    )
-
-    try:
-        loop = asyncio.get_event_loop()
-        response = await asyncio.to_thread(
-            model.generate_content,
-            [{"mime_type": "image/jpeg", "data": image_bytes}, prompt]
+        summary = "[Изображение: Gemini недоступен]"
+    else:
+        prompt = (
+            "Опиши изображение кратко и по делу. Укажи:\n"
+            "1. Что на изображении (чек, счёт, реквизиты и т.п.)\n"
+            "2. Ключевые данные (сумма, дата, реквизиты, логотип и т.д.)\n"
+            "3. Есть ли признаки ошибки/мошенничества.\n"
+            "Ответь на русском, в 2-3 предложениях."
         )
-        if not response or not response.text:
-            summary = "[Изображение: не удалось получить описание]"
-        else:
-            summary = response.text.strip()
-    except Exception as e:
-        logger.error(f"❌ Ошибка анализа изображения: {e}")
-        summary = "[Изображение: ошибка анализа]"
+        try:
+            loop = asyncio.get_event_loop()
+            response = await asyncio.to_thread(
+                model.generate_content,
+                [{"mime_type": "image/jpeg", "data": image_bytes}, prompt]
+            )
+            summary = (response.text or "[Изображение: не удалось получить описание]").strip()
+        except Exception as e:
+            logger.error(f"❌ Ошибка анализа изображения: {e}")
+            summary = "[Изображение: ошибка анализа]"
 
     # Сохраняем в кэш
     with _cache_lock:
         _image_summaries[cache_key] = summary
     logger.info(f"🖼️ Изображение {cache_key} проанализировано и закэшировано")
     return summary
-
-
-# === Подготовка истории с заменой изображений на summary ===
-async def prepare_history_for_prompt(
-    original_history: List[Dict[str, Any]],
-    user_id: int
-) -> List[Dict[str, Any]]:
-    """
-    Возвращает историю, где:
-    - Первое появление каждого изображения — с байтами
-    - Последующие — как текстовое описание (summary)
-    """
-    prepared = []
-    seen_images = set()  # для отслеживания (user_id, timestamp) изображений
-
-    for msg in original_history:
-        if msg.get("has_media") and msg.get("from_user"):
-            timestamp = msg.get("timestamp", "unknown")
-            img_key = (user_id, timestamp)
-            if img_key in seen_images:
-                # Уже видели — заменяем на summary
-                summary = _image_summaries.get(img_key, "[Изображение: заглушка]")
-                prepared.append({
-                    "from_user": True,
-                    "text": f"[ИЗОБРАЖЕНИЕ]\n{summary}",
-                    "has_media": False,
-                    "timestamp": timestamp
-                })
-            else:
-                # Первый раз — оставляем как есть (с байтами будет передано отдельно)
-                prepared.append(msg)
-                seen_images.add(img_key)
-        else:
-            prepared.append(msg)
-    return prepared
 
 
 # === Вызов модели с retry ===
@@ -265,7 +264,6 @@ async def process_ticket(
     # 🔑 Подготовка истории: изображения → summary
     prepared_history = await prepare_history_for_prompt(history, user_id)
 
-    # Формируем промпт
     prompt = (
         f"USER_ID: {user_id}\n"
         f"Тема: {theme}\n"
@@ -278,14 +276,15 @@ async def process_ticket(
 
     if ENABLE_MEDIA_ANALYSIS and image_bytes:
         try:
-            # ✅ Анализируем изображение и сохраняем описание
-            timestamp = (history[-1]["timestamp"] if history else "unknown")
-            image_summary = await analyze_and_cache_image(image_bytes, user_id, timestamp)
-
             mime_type = determine_mime_type(image_bytes, filename)
             logger.info(f"🖼️ Медиа: {len(image_bytes)} байт, MIME={mime_type}")
+
+            # ✅ Анализируем изображение и сохраняем описание
+            timestamp = history[-1]["timestamp"] if history else "unknown"
+            image_summary = await analyze_and_cache_image(image_bytes, user_id, timestamp)
+
             contents = [
-                {"mime_type": mime_type, "data": image_bytes},  # ← Gemini получает байты
+                {"mime_type": mime_type, "data": image_bytes},
                 prompt
             ]
         except Exception as e:
