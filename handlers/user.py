@@ -66,7 +66,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
     current_theme = data.get("theme")
     history = data.get("conversation_history", [])
 
-    # Скачиваем медиа (если есть)
+    # Скачиваем медиа
     image_bytes = None
     filename = ""
     if message.photo:
@@ -82,39 +82,38 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
             image_bytes = image_bytes.getvalue()
         filename = message.document.file_name or ""
 
-    # 🧠 Подготавливаем запись текущего сообщения (НЕ добавляем в историю до вызова ИИ!)
+    # Готовим запись сообщения
     new_msg = {
         "from_user": True,
         "text": message.text or message.caption or "",
         "has_media": bool(image_bytes),
         "timestamp": message.date.isoformat()
     }
+    history.append(new_msg)
+    if len(history) > 10:
+        history = history[-10:]
+    await state.update_data(conversation_history=history)
 
-    # 🔑 ПОДГОТОВКА ИСТОРИИ ДЛЯ ИИ — ТОЛЬКО ПРЕДЫДУЩИЕ СООБЩЕНИЯ
+    # 🔑 ПОДГОТОВКА ИСТОРИИ ДЛЯ ИИ: замена байтов на [ИЗОБРАЖЕНИЕ]
+    # Это экономит токены и избегает лимитов
     history_for_ai = []
-    for msg in history:  # ← history ещё без new_msg
+    for msg in history:
         clean_msg = msg.copy()
         if msg.get("has_media"):
-            clean_msg["text"] = "[ИЗОБРАЖЕНИЕ]"  # экономим токены
+            clean_msg["text"] = "[ИЗОБРАЖЕНИЕ]"
         history_for_ai.append(clean_msg)
 
-    # 🔑 ВЫЗОВ ИИ — user_message отдельно, history_for_ai без дубля
+    # Вызов ИИ (остальное без изменений)
     ai_result = await process_ticket(
         user_message=new_msg["text"],
-        history=history_for_ai,  # ✅ только прошлая история
+        history=history_for_ai,  # ← теперь безопасная история
         current_theme=current_theme,
         user_id=message.from_user.id,
         image_bytes=image_bytes,
         filename=filename
     )
 
-    # 🔄 Только ПОСЛЕ вызова ИИ добавляем сообщение в историю
-    history.append(new_msg)
-    if len(history) > 10:
-        history = history[-10:]
-    await state.update_data(conversation_history=history)
-
-    # Обновление темы при необходимости
+    # Обновляем тему при необходимости
     if ai_result.get("detected_theme"):
         await state.update_data(theme=ai_result["detected_theme"])
         await update_user(message.from_user.id, theme=ai_result["detected_theme"])
@@ -145,9 +144,9 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
     action = ai_result.get("action", "").lower()
     escalation_reason = ai_result.get("escalation_reason") or ""
     if (
-        action == "escalate"
-        or "оператор" in ai_result.get("response_to_user", "").lower()
-        or "человек" in ai_result.get("response_to_user", "").lower()
+        action == "escalate" or
+        "оператор" in ai_result.get("response_to_user", "").lower() or
+        "человек" in ai_result.get("response_to_user", "").lower()
     ):
         admin_tags = " ".join([f"<a href='tg://user?id={a}'>❗</a>" for a in ADMINS])
         reason = escalation_reason or "автоматическая эскалация"
