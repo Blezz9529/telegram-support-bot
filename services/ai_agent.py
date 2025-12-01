@@ -22,12 +22,6 @@ try:
 except ImportError:
     _IMGHDR_AVAILABLE = False
 
-from config import (
-    GEMINI_MODEL_NAME, GEMINI_TEMPERATURE, GEMINI_MAX_OUTPUT_TOKENS,
-    GEMINI_RETRY_ATTEMPTS, GEMINI_RETRY_DELAY_BASE
-)
-from services.localization import load_prompts  # ← будет реализовано ниже
-
 logger = logging.getLogger(__name__)
 ENABLE_MEDIA_ANALYSIS = True
 
@@ -35,39 +29,39 @@ ENABLE_MEDIA_ANALYSIS = True
 _image_summaries = {}
 _cache_lock = Lock()
 
-# === Загрузка промптов ===
-_prompts_cache = None
 
-def _load_prompts() -> Dict[str, Any]:
-    global _prompts_cache
-    if _prompts_cache is not None:
-        return _prompts_cache
-    try:
-        with open("locales/prompts.json", "r", encoding="utf-8") as f:
-            _prompts_cache = json.load(f)
-        logger.info("✅ Промпты загружены из locales/prompts.json")
-        return _prompts_cache
-    except FileNotFoundError:
-        logger.critical("❌ Файл locales/prompts.json не найден!")
-        raise
-    except json.JSONDecodeError as e:
-        logger.critical(f"❌ Ошибка в формате prompts.json: {e}")
-        raise
-
-
-# === MIME-определение ===
+# === MIME-определение (улучшенное) ===
 def determine_mime_type( bytes, filename: str = "") -> str:
-    if _IMGHDR_AVAILABLE:
+    # 1. Попробуем через imghdr (только если байты целые)
+    if _IMGHDR_AVAILABLE and len(data) > 100:  # ← защита от коротких байтов
         img_type = imghdr.what(None, data)
         if img_type:
             return f"image/{img_type}"
-    ext_map = {
-        'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
-        'gif': 'image/gif', 'bmp': 'image/bmp', 'pdf': 'application/pdf'
-    }
+
+    # 2. По расширению файла
     if filename:
         ext = filename.lower().split('.')[-1]
+        ext_map = {
+            'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+            'gif': 'image/gif', 'bmp': 'image/bmp', 'pdf': 'application/pdf'
+        }
         return ext_map.get(ext, 'application/octet-stream')
+
+    # 3. По сигнатуре (magic bytes)
+    if len(data) >= 4:
+        signature = data[:4]
+        if signature.startswith(b'\xff\xd8\xff\xe0'):
+            return 'image/jpeg'
+        elif signature.startswith(b'\x89PNG'):
+            return 'image/png'
+        elif signature.startswith(b'%PDF'):
+            return 'application/pdf'
+        elif signature.startswith(b'GIF'):
+            return 'image/gif'
+        elif signature.startswith(b'BM'):
+            return 'image/bmp'
+
+    # 4. Fallback
     return 'application/octet-stream'
 
 
@@ -85,19 +79,22 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
             return None
         try:
             genai.configure(api_key=api_key)
-            prompts = _load_prompts()
             _gemini_model = genai.GenerativeModel(
-                model_name=GEMINI_MODEL_NAME,
+                model_name="gemini-2.0-flash",
                 generation_config=GenerationConfig(
-                    temperature=GEMINI_TEMPERATURE,
+                    temperature=0.1,
                     top_p=0.95,
-                    max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+                    max_output_tokens=768,
                     response_mime_type="application/json"
                 ),
-                system_instruction=prompts["gemini_system_instruction"]
+                system_instruction=(
+                    "Ты — вежливый ИИ-агент поддержки. "
+                    "Отвечай на русском, кратко, по делу. "
+                    "Если нужна помощь оператора — начни ответ с ключевого слова [OPERATOR]."
+                )
             )
             _gemini_model.generate_content("OK", generation_config={"max_output_tokens": 1})
-            logger.info(f"✅ Gemini: модель {GEMINI_MODEL_NAME} инициализирована")
+            logger.info("✅ Gemini: модель gemini-2.0-flash инициализирована")
         except Exception as e:
             logger.error(f"❌ Gemini: ошибка инициализации: {e}")
             return None
@@ -110,7 +107,7 @@ def clean_gemini_response(text: str) -> tuple[str, bool]:
         data = json.loads(text.strip())
         if isinstance(data, list) and len(data) > 0:
             text = str(data[0])
-        elif isinstance(data, dict) and "response" in data:
+        elif isinstance(data, dict) and "response" in 
             text = str(data["response"])
     except:
         pass
@@ -121,34 +118,47 @@ def clean_gemini_response(text: str) -> tuple[str, bool]:
     return text, escalation
 
 
-# === Анализ изображения ===
-async def analyze_image_content(image_bytes: bytes, mime_type: str) -> str:
+# === Анализ изображения (с передачей filename) ===
+async def analyze_image_content(
+    image_bytes: bytes,
+    mime_type: str  # ← теперь принимаем mime_type извне
+) -> str:
     model = _get_gemini_model()
     if not model:
         return "[Изображение: Gemini недоступен]"
 
-    prompts = _load_prompts()
-    prompt = prompts["gemini_image_analysis_prompt"]
-
+    prompt = (
+        "Опиши изображение кратко и по делу. Укажи:\n"
+        "1. Что на изображении (чек, счёт, реквизиты и т.п.)\n"
+        "2. Ключевые данные (сумма, дата, реквизиты, логотип и т.д.)\n"
+        "3. Есть ли признаки ошибки/мошенничества.\n"
+        "Ответь на русском, в 2-3 предложениях."
+    )
     try:
         loop = asyncio.get_event_loop()
         response = await asyncio.to_thread(
             model.generate_content,
             [{"mime_type": mime_type, "data": image_bytes}, prompt]
         )
-        summary = (response.text or "[Изображение: не удалось получить описание]").strip()
-        logger.info(f"🖼️ Gemini: анализ изображения (длина={len(image_bytes)} байт): '{summary[:100]}...'")
+        if not response or not response.text:
+            logger.warning("❌ Gemini: пустой ответ при анализе изображения")
+            return "[Изображение: не удалось получить описание]"
+
+        summary = response.text.strip()
+        # ✅ Выводим полный ответ (без обрезки)
+        logger.info(f"🖼️ Gemini: анализ изображения (MIME={mime_type}, длина={len(image_bytes)} байт):\n{summary}")
         return summary
     except Exception as e:
         logger.error(f"❌ Ошибка анализа изображения: {e}")
         return "[Изображение: ошибка анализа]"
 
 
-# === Кэширование описания изображения ===
+# === Кэширование описания ===
 async def analyze_and_cache_image(
     image_bytes: bytes,
     user_id: int,
-    timestamp: str
+    timestamp: str,
+    filename: str = ""  # ← добавлен
 ) -> str:
     cache_key = (user_id, timestamp)
     with _cache_lock:
@@ -156,7 +166,8 @@ async def analyze_and_cache_image(
             logger.info(f"🖼️ Изображение {cache_key} уже проанализировано (из кэша)")
             return _image_summaries[cache_key]
 
-    mime_type = determine_mime_type(image_bytes)
+    # 🔑 Определяем MIME при кэшировании
+    mime_type = determine_mime_type(image_bytes, filename)
     summary = await analyze_image_content(image_bytes, mime_type)
 
     with _cache_lock:
@@ -195,13 +206,14 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
 
     logger.info(f"📤 Gemini: промпт (полный):\n{contents}")
 
-    for attempt in range(GEMINI_RETRY_ATTEMPTS):
+    for attempt in range(3):
         try:
             response = await asyncio.to_thread(model.generate_content, contents)
             if not response or not response.text:
                 logger.warning("❌ Gemini: пустой ответ")
                 return None
 
+            # ✅ ЛОГИРУЕМ ОТВЕТ ПОЛНОСТЬЮ (без обрезки)
             logger.info(f"📥 Gemini: ответ (сырой):\n{response.text}")
             clean_text, needs_escalation = clean_gemini_response(response.text)
             logger.info(f"✅ Gemini: очищенный ответ: {clean_text}, эскалация: {needs_escalation}")
@@ -219,8 +231,8 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
         except Exception as e:
             err_str = str(e)
             if "429" in err_str or "ResourceExhausted" in err_str or "500" in err_str or "gRPC" in err_str:
-                delay = (GEMINI_RETRY_DELAY_BASE ** attempt) + random.uniform(0, 1)
-                logger.warning(f"⏳ {err_str} — повтор через {delay:.1f} с (попытка {attempt + 1}/{GEMINI_RETRY_ATTEMPTS})")
+                delay = (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(f"⏳ {err_str} — повтор через {delay:.1f} с (попытка {attempt + 1}/3)")
                 await asyncio.sleep(delay)
                 continue
             else:
@@ -239,9 +251,7 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
 # === Fallback ===
 def _fallback_response(user_message: str, theme: str) -> Dict[str, Any]:
     text = (user_message or "").lower()
-    prompts = _load_prompts()
-    triggers = prompts["escalation_keywords"]
-    if any(t in text for t in triggers):
+    if any(t in text for t in ["угроз", "суд", "жалоб", "мошенник"]):
         return {
             "action": "escalate",
             "response_to_user": "Передаю ваш запрос оператору.",
@@ -263,16 +273,16 @@ async def process_ticket(
     current_theme: Optional[str] = None,
     user_id: int,
     image_bytes: Optional[bytes] = None,
-    filename: str = ""
+    filename: str = ""  # ← добавлен
 ) -> Dict[str, Any]:
     theme = current_theme or "deposit"
     logger.info(f"🆕 Запрос ИИ: user_id={user_id}, тема={theme}, сообщение='{user_message}'")
 
-    # 🔑 1. Анализ изображения (если есть)
+    # 🔑 1. Анализ изображения (если есть) → кэшируем
     if ENABLE_MEDIA_ANALYSIS and image_bytes:
         try:
             timestamp = history[-1]["timestamp"] if history else "unknown"
-            image_summary = await analyze_and_cache_image(image_bytes, user_id, timestamp)
+            image_summary = await analyze_and_cache_image(image_bytes, user_id, timestamp, filename)
         except Exception as e:
             logger.error(f"❌ Ошибка анализа изображения: {e}")
             image_summary = "[Изображение: ошибка анализа]"
@@ -280,31 +290,33 @@ async def process_ticket(
     # 🔑 2. Подготовка истории: изображения → summary
     prepared_history = await prepare_history_for_prompt(history, user_id)
 
-    # 🔑 3. Формируем промпт через шаблон
-    prompts = _load_prompts()
-    prompt_text = prompts["gemini_main_prompt_template"].format(
-        user_id=user_id,
-        theme=theme,
-        history=prepared_history,
-        user_message=user_message
+    prompt = (
+        f"USER_ID: {user_id}\n"
+        f"Тема: {theme}\n"
+        f"История: {prepared_history}\n"
+        f"Сообщение: {user_message}\n"
+        "---\n"
+        "Ответь кратко и вежливо на русском. Если нужны документы — попроси конкретно. "
+        "Если нужна помощь оператора — начни ответ с ключевого слова [OPERATOR]."
     )
 
-    # 🔑 4. Подготавливаем контент
+    # 🔑 3. Подготовка контента
     if ENABLE_MEDIA_ANALYSIS and image_bytes:
         try:
+            # ✅ MIME определяется **до** передачи в Gemini
             mime_type = determine_mime_type(image_bytes, filename)
             logger.info(f"🖼️ Медиа: {len(image_bytes)} байт, MIME={mime_type}")
             contents = [
                 {"mime_type": mime_type, "data": image_bytes},
-                prompt_text
+                prompt
             ]
         except Exception as e:
             logger.error(f"❌ Ошибка подготовки медиа: {e}")
-            contents = [prompt_text]
+            contents = [prompt]
     else:
-        contents = [prompt_text]
+        contents = [prompt]
 
-    # 🔑 5. Вызов ИИ
+    # 🔑 4. Вызов ИИ
     ai_result = await _call_gemini_with_contents(contents)
     if ai_result:
         return ai_result
