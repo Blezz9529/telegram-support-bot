@@ -25,7 +25,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 ENABLE_MEDIA_ANALYSIS = True
 
-# === Кэш описаний изображений ===
+# === Кэш описаний изображений (user_id, timestamp) → summary ===
 _image_summaries = {}
 _cache_lock = Lock()
 
@@ -82,35 +82,46 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     return _gemini_model
 
 
-# === Очистка ответа ===
-def clean_gemini_response(text: str) -> tuple[str, bool]:
-    # Пробуем распарсить JSON
+# === Анализ изображения отдельно (с логированием!) ===
+async def analyze_image_content(image_bytes: bytes, mime_type: str) -> str:
+    """
+    Возвращает текстовое описание изображения.
+    НЕ кэширует — кэширование делается в analyze_and_cache_image.
+    """
+    model = _get_gemini_model()
+    if not model:
+        return "[Изображение: Gemini недоступен]"
+
+    prompt = (
+        "Опиши изображение кратко и по делу. Укажи:\n"
+        "1. Что на изображении (чек, счёт, реквизиты и т.п.)\n"
+        "2. Ключевые данные (сумма, дата, реквизиты, логотип и т.д.)\n"
+        "3. Есть ли признаки ошибки/мошенничества.\n"
+        "Ответь на русском, в 2-3 предложениях."
+    )
+
     try:
-        data = json.loads(text.strip())
-        if isinstance(data, list) and len(data) > 0:
-            text = str(data[0])
-        elif isinstance(data, dict) and "response" in data:  # ✅ ИСПРАВЛЕНО: добавлено `and data`
-            text = str(data["response"])
-    except json.JSONDecodeError:
-        pass  # оставляем как есть
-
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
-
-    escalation = text.startswith("[OPERATOR]")
-    if escalation:
-        text = text.replace("[OPERATOR]", "", 1).strip()
-    return text, escalation
+        loop = asyncio.get_event_loop()
+        response = await asyncio.to_thread(
+            model.generate_content,
+            [{"mime_type": mime_type, "data": image_bytes}, prompt]
+        )
+        summary = (response.text or "[Изображение: не удалось получить описание]").strip()
+        logger.info(f"🖼️ Gemini: анализ изображения (длина={len(image_bytes)} байт): '{summary[:100]}...'")
+        return summary
+    except Exception as e:
+        logger.error(f"❌ Ошибка анализа изображения: {e}")
+        return "[Изображение: ошибка анализа]"
 
 
-# === Анализ изображения и кэширование ===
+# === Кэширование описания ===
 async def analyze_and_cache_image(
     image_bytes: bytes,
     user_id: int,
     timestamp: str
 ) -> str:
     """
-    Возвращает текстовое описание изображения.
-    Кэширует результат по (user_id, timestamp).
+    Возвращает описание изображения. Кэширует по (user_id, timestamp).
     """
     cache_key = (user_id, timestamp)
     with _cache_lock:
@@ -118,27 +129,9 @@ async def analyze_and_cache_image(
             logger.info(f"🖼️ Изображение {cache_key} уже проанализировано (из кэша)")
             return _image_summaries[cache_key]
 
-    model = _get_gemini_model()
-    if not model:
-        summary = "[Изображение: Gemini недоступен]"
-    else:
-        prompt = (
-            "Опиши изображение кратко и по делу. Укажи:\n"
-            "1. Что на изображении (чек, счёт, реквизиты и т.п.)\n"
-            "2. Ключевые данные (сумма, дата, реквизиты, логотип и т.д.)\n"
-            "3. Есть ли признаки ошибки/мошенничества.\n"
-            "Ответь на русском, в 2-3 предложениях."
-        )
-        try:
-            loop = asyncio.get_event_loop()
-            response = await asyncio.to_thread(
-                model.generate_content,
-                [{"mime_type": "image/jpeg", "data": image_bytes}, prompt]
-            )
-            summary = (response.text or "[Изображение: не удалось получить описание]").strip()
-        except Exception as e:
-            logger.error(f"❌ Ошибка анализа изображения: {e}")
-            summary = "[Изображение: ошибка анализа]"
+    # Анализируем
+    mime_type = determine_mime_type(image_bytes)
+    summary = await analyze_image_content(image_bytes, mime_type)
 
     # Сохраняем в кэш
     with _cache_lock:
@@ -154,31 +147,40 @@ async def prepare_history_for_prompt(
 ) -> List[Dict[str, Any]]:
     """
     Возвращает историю, где:
-    - Первое появление изображения: передаётся как байты (если есть)
-    - Последующие: заменяются на текстовое описание (summary)
+    - Если сообщение с has_media=True — заменяем text на "[ИЗОБРАЖЕНИЕ]\n{summary}" (если есть)
     """
     prepared = []
-    seen_images = set()  # (user_id, timestamp,)
     for msg in original_history:
         if msg.get("has_media") and msg.get("from_user"):
             timestamp = msg.get("timestamp", "unknown")
             img_key = (user_id, timestamp)
-            if img_key in seen_images:
-                # Уже видели — заменяем на summary
-                summary = _image_summaries.get(img_key, "[Изображение: описание недоступно]")
-                prepared.append({
-                    "from_user": True,
-                    "text": f"[ИЗОБРАЖЕНИЕ]\n{summary}",
-                    "has_media": False,
-                    "timestamp": timestamp
-                })
-            else:
-                # Первый раз — оставляем как есть (байты передаются отдельно)
-                prepared.append(msg)
-                seen_images.add(img_key)
+            summary = _image_summaries.get(img_key, "[Изображение: описание недоступно]")
+            prepared.append({
+                "from_user": True,
+                "text": f"[ИЗОБРАЖЕНИЕ]\n{summary}",
+                "has_media": False,  # ← теперь это текст
+                "timestamp": timestamp
+            })
         else:
             prepared.append(msg)
     return prepared
+
+
+# === Очистка ответа ===
+def clean_gemini_response(text: str) -> tuple[str, bool]:
+    try:
+        data = json.loads(text.strip())
+        if isinstance(data, list) and len(data) > 0:
+            text = str(data[0])
+        elif isinstance(data, dict) and "response" in 
+            text = str(data["response"])
+    except:
+        pass
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
+    escalation = text.startswith("[OPERATOR]")
+    if escalation:
+        text = text.replace("[OPERATOR]", "", 1).strip()
+    return text, escalation
 
 
 # === Вызов модели с retry ===
@@ -260,9 +262,19 @@ async def process_ticket(
     theme = current_theme or "deposit"
     logger.info(f"🆕 Запрос ИИ: user_id={user_id}, тема={theme}, сообщение='{user_message}'")
 
-    # 🔑 Подготовка истории: изображения → summary
+    # 🔑 1. Анализ изображения (если есть) → кэшируем
+    if ENABLE_MEDIA_ANALYSIS and image_bytes:
+        try:
+            timestamp = history[-1]["timestamp"] if history else "unknown"
+            image_summary = await analyze_and_cache_image(image_bytes, user_id, timestamp)
+        except Exception as e:
+            logger.error(f"❌ Ошибка анализа изображения: {e}")
+            image_summary = "[Изображение: ошибка анализа]"
+
+    # 🔑 2. Подготовка истории: заменяем has_media → summary
     prepared_history = await prepare_history_for_prompt(history, user_id)
 
+    # Формируем промпт
     prompt = (
         f"USER_ID: {user_id}\n"
         f"Тема: {theme}\n"
@@ -273,15 +285,11 @@ async def process_ticket(
         "Если нужна помощь оператора — начни ответ с ключевого слова [OPERATOR]."
     )
 
+    # Подготавливаем контент
     if ENABLE_MEDIA_ANALYSIS and image_bytes:
         try:
             mime_type = determine_mime_type(image_bytes, filename)
             logger.info(f"🖼️ Медиа: {len(image_bytes)} байт, MIME={mime_type}")
-
-            # ✅ Анализируем изображение и сохраняем описание
-            timestamp = history[-1]["timestamp"] if history else "unknown"
-            image_summary = await analyze_and_cache_image(image_bytes, user_id, timestamp)
-
             contents = [
                 {"mime_type": mime_type, "data": image_bytes},
                 prompt
