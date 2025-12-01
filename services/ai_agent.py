@@ -6,7 +6,7 @@ import asyncio
 import random
 import re
 from typing import Any, Dict, List, Optional
-from threading import Lock
+from pydantic import BaseModel, Field, ValidationError
 
 try:
     import google.generativeai as genai
@@ -25,9 +25,16 @@ except ImportError:
 logger = logging.getLogger(__name__)
 ENABLE_MEDIA_ANALYSIS = True
 
-# === Кэш описаний изображений (user_id, timestamp) → summary ===
-_image_summaries = {}
-_cache_lock = Lock()
+
+# === Pydantic-схема ответа (без ошибки model_type) ===
+class AgentResponse(BaseModel):
+    action: str = Field(..., pattern=r"^(reply|collect_data|escalate)$")
+    response_to_user: str
+    detected_theme: Optional[str] = None
+    data_collected: Dict[str, Any] = Field(default_factory=dict)
+    missing_data: List[str] = Field(default_factory=list)
+    escalation_reason: Optional[str] = None
+    estimated_time: Optional[str] = None
 
 
 # === MIME-определение ===
@@ -82,65 +89,8 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     return _gemini_model
 
 
-# === Очистка ответа — исправленная версия ===
-def clean_gemini_response(text: str) -> tuple[str, bool]:
-    """
-    Возвращает (очищенный_текст, эскалация_нужна)
-    """
-    # Пробуем распарсить JSON
-    try:
-        data = json.loads(text.strip())
-        if isinstance(data, list) and len(data) > 0:
-            text = str(data[0])
-        elif isinstance(data, dict) and "response" in data:
-            text = str(data["response"])
-    except json.JSONDecodeError:
-        pass  # оставляем как есть
-
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
-
-    # 🔑 ИСПРАВЛЕНО: ищем [OPERATOR] в любом месте текста
-    escalation = "[OPERATOR]" in text
-    text = text.replace("[OPERATOR]", "").strip()
-    return text, escalation
-
-
-# === Подготовка истории: изображения → summary ===
-async def prepare_history_for_prompt(
-    original_history: List[Dict[str, Any]],
-    user_id: int
-) -> List[Dict[str, Any]]:
-    """
-    Возвращает историю, где:
-    - Первое появление изображения: передаётся как байты (если есть)
-    - Последующие: заменяются на текстовое описание (summary)
-    """
-    prepared = []
-    seen_images = set()  # (user_id, timestamp,)
-    for msg in original_history:
-        if msg.get("has_media") and msg.get("from_user"):
-            timestamp = msg.get("timestamp", "unknown")
-            img_key = (user_id, timestamp)
-            if img_key in seen_images:
-                # Уже видели — заменяем на summary
-                summary = _image_summaries.get(img_key, "[Изображение: описание недоступно]")
-                prepared.append({
-                    "from_user": True,
-                    "text": f"[ИЗОБРАЖЕНИЕ]\n{summary}",
-                    "has_media": False,
-                    "timestamp": timestamp
-                })
-            else:
-                # Первый раз — оставляем как есть (байты передаются отдельно)
-                prepared.append(msg)
-                seen_images.add(img_key)
-        else:
-            prepared.append(msg)
-    return prepared
-
-
 # === Анализ изображения и кэширование ===
-async def analyze_and_cache_image(
+async def analyze_image_summary(
     image_bytes: bytes,
     user_id: int,
     timestamp: str
@@ -182,6 +132,57 @@ async def analyze_and_cache_image(
         _image_summaries[cache_key] = summary
     logger.info(f"🖼️ Изображение {cache_key} проанализировано и закэшировано")
     return summary
+
+
+# === Подготовка истории: изображения → summary ===
+async def prepare_history_for_prompt(
+    original_history: List[Dict[str, Any]],
+    user_id: int
+) -> List[Dict[str, Any]]:
+    """
+    Возвращает историю, где:
+    - Первое появление изображения: передаётся как байты (если есть)
+    - Последующие: заменяются на текстовое описание (summary)
+    """
+    prepared = []
+    seen_images = set()  # (user_id, timestamp,)
+    for msg in original_history:
+        if msg.get("has_media") and msg.get("from_user"):
+            timestamp = msg.get("timestamp", "unknown")
+            img_key = (user_id, timestamp)
+            if img_key in seen_images:
+                # Уже видели — заменяем на summary
+                summary = _image_summaries.get(img_key, "[Изображение: описание недоступно]")
+                prepared.append({
+                    "from_user": True,
+                    "text": f"[ИЗОБРАЖЕНИЕ]\n{summary}",
+                    "has_media": False,
+                    "timestamp": timestamp
+                })
+            else:
+                # Первый раз — оставляем как есть (байты передаются отдельно)
+                prepared.append(msg)
+                seen_images.add(img_key)
+        else:
+            prepared.append(msg)
+    return prepared
+
+
+# === Очистка ответа ===
+def clean_gemini_response(text: str) -> tuple[str, bool]:
+    try:
+        data = json.loads(text.strip())
+        if isinstance(data, list) and len(data) > 0:
+            text = str(data[0])
+        elif isinstance(data, dict) and "response" in 
+            text = str(data["response"])
+    except:
+        pass
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
+    escalation = text.startswith("[OPERATOR]")
+    if escalation:
+        text = text.replace("[OPERATOR]", "", 1).strip()
+    return text, escalation
 
 
 # === Вызов модели с retry ===
@@ -269,8 +270,8 @@ async def process_ticket(
     prompt = (
         f"USER_ID: {user_id}\n"
         f"Тема: {theme}\n"
-        f"История: {prepared_history}\n"
-        f"Сообщение: {user_message}\n"
+        f"История: {prepared_history}\n"  # ← без текущего сообщения
+        f"Сообщение: {user_message}\n"    # ← текущее сообщение отдельно
         "---\n"
         "Ответь кратко и вежливо на русском. Если нужны документы — попроси конкретно. "
         "Если нужна помощь оператора — начни ответ с ключевого слова [OPERATOR]."
@@ -283,7 +284,7 @@ async def process_ticket(
 
             # ✅ Анализируем изображение и сохраняем описание
             timestamp = history[-1]["timestamp"] if history else "unknown"
-            image_summary = await analyze_and_cache_image(image_bytes, user_id, timestamp)
+            image_summary = await analyze_image_summary(image_bytes, user_id, timestamp)
 
             contents = [
                 {"mime_type": mime_type, "data": image_bytes},
