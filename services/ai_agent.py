@@ -6,7 +6,7 @@ import asyncio
 import random
 import re
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field, ValidationError
+from threading import Lock
 
 try:
     import google.generativeai as genai
@@ -25,16 +25,9 @@ except ImportError:
 logger = logging.getLogger(__name__)
 ENABLE_MEDIA_ANALYSIS = True
 
-
-# === Pydantic-схема ответа (без ошибки model_type) ===
-class AgentResponse(BaseModel):
-    action: str = Field(..., pattern=r"^(reply|collect_data|escalate)$")
-    response_to_user: str
-    detected_theme: Optional[str] = None
-    data_collected: Dict[str, Any] = Field(default_factory=dict)
-    missing_data: List[str] = Field(default_factory=list)
-    escalation_reason: Optional[str] = None
-    estimated_time: Optional[str] = None
+# === Кэш описаний изображений ===
+_image_summaries = {}
+_cache_lock = Lock()
 
 
 # === MIME-определение ===
@@ -89,8 +82,28 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     return _gemini_model
 
 
+# === Очистка ответа ===
+def clean_gemini_response(text: str) -> tuple[str, bool]:
+    # Пробуем распарсить JSON
+    try:
+        data = json.loads(text.strip())
+        if isinstance(data, list) and len(data) > 0:
+            text = str(data[0])
+        elif isinstance(data, dict) and "response" in data:  # ✅ ИСПРАВЛЕНО: добавлено `and data`
+            text = str(data["response"])
+    except json.JSONDecodeError:
+        pass  # оставляем как есть
+
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
+
+    escalation = text.startswith("[OPERATOR]")
+    if escalation:
+        text = text.replace("[OPERATOR]", "", 1).strip()
+    return text, escalation
+
+
 # === Анализ изображения и кэширование ===
-async def analyze_image_summary(
+async def analyze_and_cache_image(
     image_bytes: bytes,
     user_id: int,
     timestamp: str
@@ -166,23 +179,6 @@ async def prepare_history_for_prompt(
         else:
             prepared.append(msg)
     return prepared
-
-
-# === Очистка ответа ===
-def clean_gemini_response(text: str) -> tuple[str, bool]:
-    try:
-        data = json.loads(text.strip())
-        if isinstance(data, list) and len(data) > 0:
-            text = str(data[0])
-        elif isinstance(data, dict) and "response" in 
-            text = str(data["response"])
-    except:
-        pass
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
-    escalation = text.startswith("[OPERATOR]")
-    if escalation:
-        text = text.replace("[OPERATOR]", "", 1).strip()
-    return text, escalation
 
 
 # === Вызов модели с retry ===
@@ -270,8 +266,8 @@ async def process_ticket(
     prompt = (
         f"USER_ID: {user_id}\n"
         f"Тема: {theme}\n"
-        f"История: {prepared_history}\n"  # ← без текущего сообщения
-        f"Сообщение: {user_message}\n"    # ← текущее сообщение отдельно
+        f"История: {prepared_history}\n"
+        f"Сообщение: {user_message}\n"
         "---\n"
         "Ответь кратко и вежливо на русском. Если нужны документы — попроси конкретно. "
         "Если нужна помощь оператора — начни ответ с ключевого слова [OPERATOR]."
@@ -284,7 +280,7 @@ async def process_ticket(
 
             # ✅ Анализируем изображение и сохраняем описание
             timestamp = history[-1]["timestamp"] if history else "unknown"
-            image_summary = await analyze_image_summary(image_bytes, user_id, timestamp)
+            image_summary = await analyze_and_cache_image(image_bytes, user_id, timestamp)
 
             contents = [
                 {"mime_type": mime_type, "data": image_bytes},
