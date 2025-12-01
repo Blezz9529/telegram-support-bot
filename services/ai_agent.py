@@ -25,7 +25,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 ENABLE_MEDIA_ANALYSIS = True
 
-# === Кэш описаний изображений (user_id, timestamp) → summary ===
+# === Кэш описаний изображений ===
 _image_summaries = {}
 _cache_lock = Lock()
 
@@ -82,11 +82,40 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     return _gemini_model
 
 
-# === Анализ изображения отдельно (с логированием!) ===
+# === Очистка ответа — исправленная версия ===
+def clean_gemini_response(text: str) -> tuple[str, bool]:
+    """
+    Возвращает (очищенный_текст, эскалация_нужна)
+    """
+    # 1. Пытаемся распарсить JSON
+    try:
+        data = json.loads(text.strip())
+        # Если это dict с "response" — используем его
+        if isinstance(data, dict) and "response" in data:
+            text = str(data["response"])
+        # Если это list — берём первый элемент
+        elif isinstance(data, list) and len(data) > 0:
+            item = data[0]
+            if isinstance(item, dict) and "response" in item:
+                text = str(item["response"])
+            else:
+                text = str(item)
+    except json.JSONDecodeError:
+        pass  # оставляем как есть
+
+    # 2. Убираем бинарный мусор
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
+
+    # 3. Проверяем на эскалацию (везде в тексте)
+    escalation = "[OPERATOR]" in text
+    text = text.replace("[OPERATOR]", "").strip()
+    return text, escalation
+
+
+# === Анализ изображения (с правильным MIME) ===
 async def analyze_image_content(image_bytes: bytes, mime_type: str) -> str:
     """
     Возвращает текстовое описание изображения.
-    НЕ кэширует — кэширование делается в analyze_and_cache_image.
     """
     model = _get_gemini_model()
     if not model:
@@ -129,8 +158,8 @@ async def analyze_and_cache_image(
             logger.info(f"🖼️ Изображение {cache_key} уже проанализировано (из кэша)")
             return _image_summaries[cache_key]
 
-    # Анализируем
-    mime_type = determine_mime_type(image_bytes)
+    # Определяем MIME до вызова Gemini
+    mime_type = determine_mime_type(image_bytes, f"image_{timestamp}.jpg")
     summary = await analyze_image_content(image_bytes, mime_type)
 
     # Сохраняем в кэш
@@ -164,23 +193,6 @@ async def prepare_history_for_prompt(
         else:
             prepared.append(msg)
     return prepared
-
-
-# === Очистка ответа ===
-def clean_gemini_response(text: str) -> tuple[str, bool]:
-    try:
-        data = json.loads(text.strip())
-        if isinstance(data, list) and len(data) > 0:
-            text = str(data[0])
-        elif isinstance(data, dict) and "response" in data:
-            text = str(data["response"])
-    except:
-        pass
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
-    escalation = text.startswith("[OPERATOR]")
-    if escalation:
-        text = text.replace("[OPERATOR]", "", 1).strip()
-    return text, escalation
 
 
 # === Вызов модели с retry ===
@@ -271,10 +283,9 @@ async def process_ticket(
             logger.error(f"❌ Ошибка анализа изображения: {e}")
             image_summary = "[Изображение: ошибка анализа]"
 
-    # 🔑 2. Подготовка истории: заменяем has_media → summary
+    # 🔑 2. Подготовка истории: изображения → summary
     prepared_history = await prepare_history_for_prompt(history, user_id)
 
-    # Формируем промпт
     prompt = (
         f"USER_ID: {user_id}\n"
         f"Тема: {theme}\n"
