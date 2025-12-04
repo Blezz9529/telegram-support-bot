@@ -97,7 +97,7 @@ def load_prompts() -> Dict[str, str]:
 
 
 # === MIME-определение ===
-def determine_mime_type( bytes, filename: str = "") -> str:
+def determine_mime_type(data: bytes, filename: str = "") -> str:
     if _IMGHDR_AVAILABLE:
         img_type = imghdr.what(None, data)
         if img_type:

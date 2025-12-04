@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SUPPORT_GROUP_ID = int(os.getenv("SUPPORT_GROUP_ID"))
+SUPPORT_GROUP_ID = int(os.getenv("SUPPORT_GROUP_ID", "0"))
 ADMINS = [int(x) for x in os.getenv("ADMINS", "").split(",") if x.strip()]
 
 # === Настройки ИИ ===
