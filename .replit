@@ -5,3 +5,32 @@ expertMode = true
 [nix]
 channel = "stable-25_05"
 packages = ["file"]
+
+[userenv]
+
+[userenv.shared]
+SUPPORT_GROUP_ID = "-1003454698833"
+ADMINS = "1941348923"
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Run Telegram Bot"
+
+[[workflows.workflow]]
+name = "Run Telegram Bot"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python main.py"
+
+[workflows.workflow.metadata]
+outputType = "console"
