@@ -168,8 +168,15 @@ def clean_gemini_response(text: str) -> tuple[str, bool]:
         data = json.loads(text.strip())
         if isinstance(data, list) and len(data) > 0:
             text = str(data[0])
-        elif isinstance(data, dict) and "response" in data:
-            text = str(data["response"])
+        elif isinstance(data, dict):
+            if "response" in data:
+                text = str(data["response"])
+            elif "answer" in data:
+                text = str(data["answer"])
+            elif "text" in data:
+                text = str(data["text"])
+            elif "message" in data:
+                text = str(data["message"])
     except:
         pass
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
@@ -227,24 +234,17 @@ async def prepare_history_for_prompt(
     user_id: int
 ) -> List[Dict[str, Any]]:
     prepared = []
-    seen_images = set()  # (user_id, timestamp,)
     for msg in original_history:
         if msg.get("has_media") and msg.get("from_user"):
             timestamp = msg.get("timestamp", "unknown")
             img_key = (user_id, timestamp)
-            if img_key in seen_images:
-                # Уже видели — заменяем на summary
-                summary = _image_summaries.get(img_key, "[Изображение: описание недоступно]")
-                prepared.append({
-                    "from_user": True,
-                    "text": f"[ИЗОБРАЖЕНИЕ]\n{summary}",
-                    "has_media": False,
-                    "timestamp": timestamp
-                })
-            else:
-                # Первый раз — оставляем как есть (байты передаются отдельно)
-                prepared.append(msg)
-                seen_images.add(img_key)
+            summary = _image_summaries.get(img_key, "[Изображение: описание недоступно]")
+            prepared.append({
+                "from_user": True,
+                "text": f"[ИЗОБРАЖЕНИЕ]\n{summary}",
+                "has_media": False,
+                "timestamp": timestamp
+            })
         else:
             prepared.append(msg)
     return prepared
