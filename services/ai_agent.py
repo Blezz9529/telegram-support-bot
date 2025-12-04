@@ -131,7 +131,7 @@ def clean_gemini_response(text: str) -> tuple[str, bool]:
         data = json.loads(text.strip())
         if isinstance(data, list) and len(data) > 0:
             text = str(data[0])
-        elif isinstance(data, dict) and "response" in 
+        elif isinstance(data, dict) and "response" in data:
             text = str(data["response"])
     except:
         pass
