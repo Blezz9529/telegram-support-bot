@@ -35,27 +35,45 @@ def load_prompts() -> Dict[str, str]:
     try:
         with open("locales/prompts.json", "r", encoding="utf-8") as f:
             content = f.read()
-            # Убираем control characters
             content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', content).strip()
             data = json.loads(content)
 
-            # 🔑 Поддержка вложенной структуры (ваш новый формат)
+            # Build system instruction from CORE_STYLE_RULES if available
             system_instruction = data.get("gemini_system_instruction", "")
-            if isinstance(system_instruction, dict):
-                # Извлекаем только текст из вашей структуры
+            if not system_instruction and "CORE_STYLE_RULES" in data:
+                core = data["CORE_STYLE_RULES"]
+                strict = data.get("STRICT_BEHAVIOR_RULES", {})
+                operator = data.get("OPERATOR_RULES", {})
+                persona = core.get("persona", "ИИ-агент поддержки")
+                tone = core.get("tone", "кратко, по делу")
+                lang = core.get("language", "Русский")
+                max_sentences = strict.get("max_sentences", 3)
+                operator_prefix = core.get("operator_prefix", "[OPERATOR]")
+                system_instruction = (
+                    f"Ты — {persona}. Язык: {lang}. Тон: {tone}. "
+                    f"Максимум {max_sentences} предложения в ответе. "
+                    f"Если нужна помощь оператора — начни ответ с {operator_prefix}."
+                )
+            elif isinstance(system_instruction, dict):
                 persona = system_instruction.get("role_style", {}).get("persona", "ИИ-агент поддержки")
                 tone = system_instruction.get("role_style", {}).get("tone", "кратко, по делу")
                 operator_rule = system_instruction.get("general_rules", {}).get("operator_call_format", "[OPERATOR]")
                 system_instruction = f"Ты — {persona}. {tone}. Если нужна помощь оператора — начни ответ с ключевого слова {operator_rule}."
-            elif not isinstance(system_instruction, str):
+            elif not system_instruction:
                 system_instruction = "Ты — вежливый ИИ-агент поддержки. Отвечай на русском, кратко, по делу. Если нужна помощь оператора — начни ответ с [OPERATOR]."
 
+            # Build image prompt from IMAGE_ANALYSIS if available
             image_prompt = data.get("gemini_image_analysis_prompt", "")
-            if not isinstance(image_prompt, str):
+            if not image_prompt and "IMAGE_ANALYSIS" in data:
+                img = data["IMAGE_ANALYSIS"]
+                reqs = img.get("requirements", [])
+                image_prompt = f"Опиши изображение в {img.get('format', '1-2 предложения')}. Укажи: {', '.join(reqs)}."
+            elif not image_prompt:
                 image_prompt = "Опиши изображение кратко и по делу. Укажи: что на изображении, ключевые данные. Ответь на русском, в 2-3 предложениях."
 
-            main_prompt = data.get("gemini_main_prompt_template", "")
-            if not isinstance(main_prompt, str):
+            # Get main prompt template
+            main_prompt = data.get("gemini_main_prompt_template", "") or data.get("MAIN_PROMPT_TEMPLATE", "")
+            if not main_prompt:
                 main_prompt = "USER_ID: {user_id}\nТема: {theme}\nИстория: {history}\nСообщение: {user_message}\n---\nОтветь кратко и вежливо на русском. Если нужны документы — попроси конкретно. Если нужна помощь оператора — начни ответ с [OPERATOR]."
 
             return {
