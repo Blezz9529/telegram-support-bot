@@ -137,7 +137,6 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
                 ),
                 system_instruction=prompts["gemini_system_instruction"]
             )
-            _gemini_model.generate_content("OK", generation_config={"max_output_tokens": 1})
             logger.info("✅ Gemini: модель gemini-2.0-flash инициализирована")
         except Exception as e:
             logger.error(f"❌ Gemini: ошибка инициализации: {e}")
