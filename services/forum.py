@@ -10,12 +10,17 @@ from services.localization import load_button
 logger = logging.getLogger(__name__)
 
 
+# ✅ Исправлено: проверка существования топика через попытку отправки
 async def _topic_exists(bot: Bot, topic_id: int) -> bool:
-    """Проверяет, существует ли топик"""
     try:
-        await bot.get_forum_topic(chat_id=SUPPORT_GROUP_ID, message_thread_id=topic_id)
+        msg = await bot.send_message(
+            chat_id=SUPPORT_GROUP_ID,
+            text="🔍",
+            message_thread_id=topic_id
+        )
+        await bot.delete_message(SUPPORT_GROUP_ID, msg.message_id)
         return True
-    except TelegramAPIError:
+    except (TelegramBadRequest, TelegramAPIError):
         return False
 
 
@@ -29,9 +34,11 @@ async def get_or_create_topic(
     user_data = await get_user(user_id)
     topic_id = user_data.get("topic_id") if user_data else None
 
+    # Проверяем, существует ли топик
     if topic_id and await _topic_exists(bot, topic_id):
         return topic_id
 
+    # Создаём новый топик
     title = f"🆔 {user_id} | @{username or '—'}"
     try:
         topic = await bot.create_forum_topic(
@@ -66,14 +73,12 @@ async def send_to_topic(
     )
     text_content = message.text or message.caption or ""
 
-    # Кнопка блокировки
     block_btn = InlineKeyboardButton(
         text=await load_button("inline", "block"),
         callback_data=f"block_user:{user['user_id']}"
     )
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[[block_btn]])
 
-    # Отправка в зависимости от типа сообщения
     if message.photo:
         caption = (header + text_content).strip()
         if not caption:
@@ -84,7 +89,7 @@ async def send_to_topic(
             caption=caption,
             message_thread_id=topic_id,
             parse_mode="HTML",
-            reply_markup=reply_markup
+            reply_markup=reply_markup  # ✅ Кнопка сразу в фото
         )
     elif message.document:
         caption = (header + text_content).strip()
@@ -96,7 +101,7 @@ async def send_to_topic(
             caption=caption,
             message_thread_id=topic_id,
             parse_mode="HTML",
-            reply_markup=reply_markup
+            reply_markup=reply_markup  # ✅ Кнопка сразу в документе
         )
     elif message.video:
         caption = (header + text_content).strip()
@@ -108,7 +113,7 @@ async def send_to_topic(
             caption=caption,
             message_thread_id=topic_id,
             parse_mode="HTML",
-            reply_markup=reply_markup
+            reply_markup=reply_markup  # ✅ Кнопка сразу в видео
         )
     else:
         full_text = (header + text_content).strip()
@@ -119,7 +124,7 @@ async def send_to_topic(
             text=full_text,
             message_thread_id=topic_id,
             parse_mode="HTML",
-            reply_markup=reply_markup
+            reply_markup=reply_markup  # ✅ Кнопка в текстовом сообщении
         )
 
     await update_user(user["user_id"], last_message_id=sent.message_id)

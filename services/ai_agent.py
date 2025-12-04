@@ -25,33 +25,53 @@ except ImportError:
 logger = logging.getLogger(__name__)
 ENABLE_MEDIA_ANALYSIS = True
 
-# === Кэш описаний изображений (user_id, timestamp) → summary ===
+# === Кэш описаний изображений ===
 _image_summaries = {}
 _cache_lock = Lock()
 
 
-# === Загрузка промптов из файла ===
+# === Загрузка промптов (с поддержкой любой структуры) ===
 def load_prompts() -> Dict[str, str]:
     try:
         with open("locales/prompts.json", "r", encoding="utf-8") as f:
             content = f.read()
-            # 🔍 Убираем control characters (частая причина JSONDecodeError)
-            import re
+            # Убираем control characters
             content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', content).strip()
             data = json.loads(content)
-            logger.info(f"✅ Промпты загружены из файла (ключи: {list(data.keys())})")
-            return data
+
+            # 🔑 Поддержка вложенной структуры (ваш новый формат)
+            system_instruction = data.get("gemini_system_instruction", "")
+            if isinstance(system_instruction, dict):
+                # Извлекаем только текст из вашей структуры
+                persona = system_instruction.get("role_style", {}).get("persona", "ИИ-агент поддержки")
+                tone = system_instruction.get("role_style", {}).get("tone", "кратко, по делу")
+                operator_rule = system_instruction.get("general_rules", {}).get("operator_call_format", "[OPERATOR]")
+                system_instruction = f"Ты — {persona}. {tone}. Если нужна помощь оператора — начни ответ с ключевого слова {operator_rule}."
+            elif not isinstance(system_instruction, str):
+                system_instruction = "Ты — вежливый ИИ-агент поддержки. Отвечай на русском, кратко, по делу. Если нужна помощь оператора — начни ответ с [OPERATOR]."
+
+            image_prompt = data.get("gemini_image_analysis_prompt", "")
+            if not isinstance(image_prompt, str):
+                image_prompt = "Опиши изображение кратко и по делу. Укажи: что на изображении, ключевые данные. Ответь на русском, в 2-3 предложениях."
+
+            main_prompt = data.get("gemini_main_prompt_template", "")
+            if not isinstance(main_prompt, str):
+                main_prompt = "USER_ID: {user_id}\nТема: {theme}\nИстория: {history}\nСообщение: {user_message}\n---\nОтветь кратко и вежливо на русском. Если нужны документы — попроси конкретно. Если нужна помощь оператора — начни ответ с [OPERATOR]."
+
+            return {
+                "gemini_system_instruction": system_instruction,
+                "gemini_image_analysis_prompt": image_prompt,
+                "gemini_main_prompt_template": main_prompt
+            }
+
     except FileNotFoundError:
-        logger.warning("⚠️ Файл locales/prompts.json не найден — использую fallback")
+        logger.warning("⚠️ locales/prompts.json не найден — использую fallback")
     except json.JSONDecodeError as e:
         logger.error(f"❌ Ошибка парсинга prompts.json: {e}")
-        logger.error(f"📍 Позиция: строка {e.lineno}, столбец {e.colno}, символ {e.pos}")
-        logger.error(f"📍 Текст рядом: ...{e.doc[max(0, e.pos - 50):e.pos + 50]}...")
     except Exception as e:
-        logger.exception(f"💥 Неизвестная ошибка при загрузке промптов: {e}")
+        logger.exception(f"💥 Ошибка загрузки промптов: {e}")
 
-    # 🔑 Fallback — если JSON сломан или нет файла
-    logger.info("💡 Используется fallback-промпты")
+    # Fallback
     return {
         "gemini_system_instruction": (
             "Ты — вежливый ИИ-агент поддержки. "
@@ -92,7 +112,7 @@ def determine_mime_type( bytes, filename: str = "") -> str:
     return 'application/octet-stream'
 
 
-# === Инициализация модели ===
+# === Инициализация модели (исправлено: убраны неподдерживаемые поля в system_instruction) ===
 _gemini_model = None
 
 def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
@@ -107,6 +127,7 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
         try:
             genai.configure(api_key=api_key)
             prompts = load_prompts()
+            # ✅ system_instruction — только строка
             _gemini_model = genai.GenerativeModel(
                 model_name="gemini-2.0-flash",
                 generation_config=GenerationConfig(
@@ -115,7 +136,7 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
                     max_output_tokens=768,
                     response_mime_type="application/json"
                 ),
-                system_instruction=prompts["gemini_system_instruction"]
+                system_instruction=prompts["gemini_system_instruction"]  # ← только строка
             )
             _gemini_model.generate_content("OK", generation_config={"max_output_tokens": 1})
             logger.info("✅ Gemini: модель gemini-2.0-flash инициализирована")
@@ -213,7 +234,6 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
     if not model:
         return None
 
-    # ✅ ПОЛНОЕ ЛОГИРОВАНИЕ ПРОМПТА
     logger.info(f"📤 Gemini: промпт (полный):\n{contents}")
 
     for attempt in range(3):
@@ -223,7 +243,6 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
                 logger.warning("❌ Gemini: пустой ответ")
                 return None
 
-            # ✅ ПОЛНОЕ ЛОГИРОВАНИЕ ОТВЕТА
             logger.info(f"📥 Gemini: ответ (сырой):\n{response.text}")
             clean_text, needs_escalation = clean_gemini_response(response.text)
             logger.info(f"✅ Gemini: очищенный ответ: {clean_text}, эскалация: {needs_escalation}")
@@ -275,7 +294,7 @@ def _fallback_response(user_message: str, theme: str) -> Dict[str, Any]:
     }
 
 
-# === Основной вход (async def, как и должно быть) ===
+# === Основной вход ===
 async def process_ticket(
     *,
     user_message: str,
