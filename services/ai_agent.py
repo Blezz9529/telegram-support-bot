@@ -35,7 +35,7 @@ def load_prompts() -> Dict[str, str]:
     try:
         with open("locales/prompts.json", "r", encoding="utf-8") as f:
             content = f.read()
-            # 🔍 Убираем control characters
+            # 🔍 Убираем control characters (частая причина JSONDecodeError)
             import re
             content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', content).strip()
             data = json.loads(content)
@@ -46,10 +46,12 @@ def load_prompts() -> Dict[str, str]:
     except json.JSONDecodeError as e:
         logger.error(f"❌ Ошибка парсинга prompts.json: {e}")
         logger.error(f"📍 Позиция: строка {e.lineno}, столбец {e.colno}, символ {e.pos}")
+        logger.error(f"📍 Текст рядом: ...{e.doc[max(0, e.pos - 50):e.pos + 50]}...")
     except Exception as e:
         logger.exception(f"💥 Неизвестная ошибка при загрузке промптов: {e}")
-    
-    # Fallback
+
+    # 🔑 Fallback — если JSON сломан или нет файла
+    logger.info("💡 Используется fallback-промпты")
     return {
         "gemini_system_instruction": (
             "Ты — вежливый ИИ-агент поддержки. "
@@ -129,7 +131,7 @@ def clean_gemini_response(text: str) -> tuple[str, bool]:
         data = json.loads(text.strip())
         if isinstance(data, list) and len(data) > 0:
             text = str(data[0])
-        elif isinstance(data, dict) and "response" in data:
+        elif isinstance(data, dict) and "response" in 
             text = str(data["response"])
     except:
         pass
@@ -182,12 +184,13 @@ async def prepare_history_for_prompt(
     user_id: int
 ) -> List[Dict[str, Any]]:
     prepared = []
-    seen_images = set()
+    seen_images = set()  # (user_id, timestamp,)
     for msg in original_history:
         if msg.get("has_media") and msg.get("from_user"):
             timestamp = msg.get("timestamp", "unknown")
             img_key = (user_id, timestamp)
             if img_key in seen_images:
+                # Уже видели — заменяем на summary
                 summary = _image_summaries.get(img_key, "[Изображение: описание недоступно]")
                 prepared.append({
                     "from_user": True,
@@ -196,6 +199,7 @@ async def prepare_history_for_prompt(
                     "timestamp": timestamp
                 })
             else:
+                # Первый раз — оставляем как есть (байты передаются отдельно)
                 prepared.append(msg)
                 seen_images.add(img_key)
         else:
@@ -203,13 +207,13 @@ async def prepare_history_for_prompt(
     return prepared
 
 
-# === Вызов модели с retry и логированием ===
+# === Вызов модели с retry ===
 async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
     model = _get_gemini_model()
     if not model:
         return None
 
-    # ✅ ЛОГИРУЕМ ПОЛНОСТЬЮ (без обрезки)
+    # ✅ ПОЛНОЕ ЛОГИРОВАНИЕ ПРОМПТА
     logger.info(f"📤 Gemini: промпт (полный):\n{contents}")
 
     for attempt in range(3):
@@ -219,7 +223,7 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
                 logger.warning("❌ Gemini: пустой ответ")
                 return None
 
-            # ✅ ЛОГИРУЕМ ОТВЕТ ПОЛНОСТЬЮ (без обрезки)
+            # ✅ ПОЛНОЕ ЛОГИРОВАНИЕ ОТВЕТА
             logger.info(f"📥 Gemini: ответ (сырой):\n{response.text}")
             clean_text, needs_escalation = clean_gemini_response(response.text)
             logger.info(f"✅ Gemini: очищенный ответ: {clean_text}, эскалация: {needs_escalation}")
@@ -271,7 +275,7 @@ def _fallback_response(user_message: str, theme: str) -> Dict[str, Any]:
     }
 
 
-# === Основной вход ===
+# === Основной вход (async def, как и должно быть) ===
 async def process_ticket(
     *,
     user_message: str,
