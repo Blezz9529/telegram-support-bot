@@ -1,8 +1,13 @@
 # services/forum.py
 import logging
+import asyncio
 from aiogram import Bot
 from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramAPIError,
+    TelegramRetryAfter
+)
 from config import SUPPORT_GROUP_ID, ADMINS
 from storages.db import update_user, get_user
 from services.localization import load_button
@@ -10,9 +15,10 @@ from services.localization import load_button
 logger = logging.getLogger(__name__)
 
 
-# ✅ Исправлено: проверка существования топика через попытку отправки
+# === Проверка существования топика ===
 async def _topic_exists(bot: Bot, topic_id: int) -> bool:
     try:
+        # Проверяем топик через отправку и удаление служебного сообщения
         msg = await bot.send_message(
             chat_id=SUPPORT_GROUP_ID,
             text="🔍",
@@ -55,6 +61,31 @@ async def get_or_create_topic(
         raise
 
 
+# === Надёжная отправка сообщения ===
+async def send_message_with_retry(bot: Bot, **kwargs):
+    for attempt in range(3):
+        try:
+            return await bot.send_message(**kwargs)
+        except TelegramRetryAfter as e:
+            delay = e.retry_after + 0.5
+            logger.warning(f"⏳ Flood control: ждём {delay:.1f}с")
+            await asyncio.sleep(delay)
+        except TelegramBadRequest as e:
+            if "text must be non-empty" in str(e):
+                if "text" in kwargs and not kwargs["text"].strip():
+                    kwargs["text"] = "—"
+                else:
+                    raise
+            else:
+                raise
+        except Exception as e:
+            if attempt == 2:
+                raise
+            delay = 1 * (2 ** attempt)
+            logger.warning(f"⚠️ Ошибка отправки: {e}. Повтор через {delay}s")
+            await asyncio.sleep(delay)
+
+
 async def send_to_topic(
     bot: Bot,
     user: dict,
@@ -73,12 +104,14 @@ async def send_to_topic(
     )
     text_content = message.text or message.caption or ""
 
+    # Кнопка блокировки
     block_btn = InlineKeyboardButton(
         text=await load_button("inline", "block"),
         callback_data=f"block_user:{user['user_id']}"
     )
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[[block_btn]])
 
+    # Отправка в зависимости от типа сообщения
     if message.photo:
         caption = (header + text_content).strip()
         if not caption:
@@ -119,7 +152,8 @@ async def send_to_topic(
         full_text = (header + text_content).strip()
         if not full_text:
             full_text = "💬 Пустое сообщение от пользователя"
-        sent = await bot.send_message(
+        sent = await send_message_with_retry(
+            bot,
             chat_id=SUPPORT_GROUP_ID,
             text=full_text,
             message_thread_id=topic_id,
@@ -127,5 +161,7 @@ async def send_to_topic(
             reply_markup=reply_markup  # ✅ Кнопка в текстовом сообщении
         )
 
+    # ✅ СОХРАНЯЕМ message_id для отслеживания (но НЕ тэг админов при создании)
     await update_user(user["user_id"], last_message_id=sent.message_id)
+    logger.info(f"✅ Сообщение {sent.message_id} отправлено в топик {topic_id} для {user['user_id']}")
     return sent.message_id

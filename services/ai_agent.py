@@ -112,7 +112,7 @@ def determine_mime_type( bytes, filename: str = "") -> str:
     return 'application/octet-stream'
 
 
-# === Инициализация модели (исправлено: убраны неподдерживаемые поля в system_instruction) ===
+# === Инициализация модели ===
 _gemini_model = None
 
 def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
@@ -127,7 +127,6 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
         try:
             genai.configure(api_key=api_key)
             prompts = load_prompts()
-            # ✅ system_instruction — только строка
             _gemini_model = genai.GenerativeModel(
                 model_name="gemini-2.0-flash",
                 generation_config=GenerationConfig(
@@ -136,7 +135,7 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
                     max_output_tokens=768,
                     response_mime_type="application/json"
                 ),
-                system_instruction=prompts["gemini_system_instruction"]  # ← только строка
+                system_instruction=prompts["gemini_system_instruction"]
             )
             _gemini_model.generate_content("OK", generation_config={"max_output_tokens": 1})
             logger.info("✅ Gemini: модель gemini-2.0-flash инициализирована")
@@ -146,7 +145,7 @@ def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
     return _gemini_model
 
 
-# === Очистка ответа ===
+# === Очистка ответа (исправлена: удаляет [OPERATOR] из любого места) ===
 def clean_gemini_response(text: str) -> tuple[str, bool]:
     try:
         data = json.loads(text.strip())
@@ -157,9 +156,13 @@ def clean_gemini_response(text: str) -> tuple[str, bool]:
     except:
         pass
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
-    escalation = text.startswith("[OPERATOR]")
-    if escalation:
-        text = text.replace("[OPERATOR]", "", 1).strip()
+
+    # 🔑 УДАЛЯЕМ [OPERATOR] из любого места в тексте (не только в начале)
+    escalation = "[OPERATOR]" in text
+    text = text.replace("[OPERATOR]", "").strip()
+    # Убираем лишние пробелы после удаления
+    text = re.sub(r'\s+', ' ', text).strip()
+
     return text, escalation
 
 
@@ -193,9 +196,11 @@ async def analyze_and_cache_image(
             logger.error(f"❌ Ошибка анализа изображения: {e}")
             summary = "[Изображение: ошибка анализа]"
 
+    # ✅ ЛОГИРУЕМ РЕЗУЛЬТАТ АНАЛИЗА
+    logger.info(f"🖼️ Изображение {cache_key} проанализировано. Результат: {summary}")
+
     with _cache_lock:
         _image_summaries[cache_key] = summary
-    logger.info(f"🖼️ Изображение {cache_key} проанализировано и закэшировано")
     return summary
 
 
@@ -228,12 +233,13 @@ async def prepare_history_for_prompt(
     return prepared
 
 
-# === Вызов модели с retry ===
+# === Вызов модели с retry и логированием ===
 async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
     model = _get_gemini_model()
     if not model:
         return None
 
+    # ✅ ЛОГИРУЕМ ПОЛНОСТЬЮ ПРОМПТ
     logger.info(f"📤 Gemini: промпт (полный):\n{contents}")
 
     for attempt in range(3):
@@ -243,8 +249,10 @@ async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
                 logger.warning("❌ Gemini: пустой ответ")
                 return None
 
+            # ✅ ЛОГИРУЕМ СЫРОЙ ОТВЕТ
             logger.info(f"📥 Gemini: ответ (сырой):\n{response.text}")
             clean_text, needs_escalation = clean_gemini_response(response.text)
+            # ✅ ЛОГИРУЕМ ОЧИЩЕННЫЙ ОТВЕТ
             logger.info(f"✅ Gemini: очищенный ответ: {clean_text}, эскалация: {needs_escalation}")
 
             action = "escalate" if needs_escalation else "reply"
