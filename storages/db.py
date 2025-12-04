@@ -50,6 +50,20 @@ async def get_user(user_id: int) -> Optional[Dict[str, Any]]:
         return user
 
 
+async def get_user_by_topic_id(topic_id: int) -> Optional[Dict[str, Any]]:
+    """Получает пользователя по topic_id. Возвращает dict или None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM users WHERE topic_id = ?", (topic_id,))
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        user = dict(row)
+        user["is_blocked"] = bool(user["is_blocked"])
+        user["first_message_in_ticket"] = bool(user["first_message_in_ticket"])
+        return user
+
+
 async def create_user(user_id: int, username: str = "", full_name: str = ""):
     """Создаёт пользователя, если не существует."""
     async with aiosqlite.connect(DB_PATH) as db:

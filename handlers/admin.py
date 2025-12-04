@@ -3,7 +3,7 @@ from aiogram import Router, Bot, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from config import SUPPORT_GROUP_ID, ADMINS
-from storages.db import get_user, update_user
+from storages.db import get_user, get_user_by_topic_id, update_user
 from services.localization import load_text
 
 router = Router()
@@ -17,17 +17,22 @@ router = Router()
 async def handle_admin_reply(message: Message, bot: Bot):
     """Обработка ответов админов в топиках"""
     reply = message.reply_to_message
+    topic_id = message.message_thread_id
 
-    # Проверяем: ответ именно на пересланное сообщение от пользователя
-    if not reply or not reply.forward_from:
-        await message.reply(await load_text("invalid_reply"))
-        return
+    user = None
+    user_id = None
 
-    user_id = reply.forward_from.id
-    user = await get_user(user_id)
+    if reply and reply.forward_from:
+        user_id = reply.forward_from.id
+        user = await get_user(user_id)
+
+    if not user and topic_id:
+        user = await get_user_by_topic_id(topic_id)
+        if user:
+            user_id = user["user_id"]
 
     if not user:
-        await message.reply(f"⚠️ Пользователь {user_id} не найден в БД.")
+        await message.reply(await load_text("invalid_reply"))
         return
 
     if user["is_blocked"]:
