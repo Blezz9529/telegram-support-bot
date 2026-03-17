@@ -17,3 +17,11 @@ GEMINI_RETRY_DELAY_BASE = float(os.getenv("GEMINI_RETRY_DELAY_BASE", "2.0"))
 
 # === Пути ===
 PROMPTS_PATH = "locales/prompts.json"
+
+# === Виджет ===
+WIDGET_SESSION_TTL_HOURS = int(os.getenv("WIDGET_SESSION_TTL_HOURS", "24"))
+
+# === API site_id <-> telegram_id ===
+SITE_ID_API_URL = os.getenv("SITE_ID_API_URL", "https://mega-slot-bot.ru/get_id")
+SITE_ID_API_TOKEN = os.getenv("SITE_ID_API_TOKEN", "")
+SITE_ID_API_TIMEOUT = float(os.getenv("SITE_ID_API_TIMEOUT", "5"))

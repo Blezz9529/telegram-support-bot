@@ -8,6 +8,9 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from config import BOT_TOKEN, SUPPORT_GROUP_ID
 
+# Исправление для uvloop на macOS
+asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+
 # Настройка логгера
 logging.basicConfig(
     level=logging.INFO,
@@ -27,12 +30,13 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-
 # Импорт хэндлеров
 try:
-    from handlers import user, admin
+    from handlers import user, admin, widget
     dp.include_router(user.router)
     dp.include_router(admin.router)
+    # Router виджета не нужен — это REST API + WebSocket
+    logger.info("✅ Хэндлеры загружены (user, admin, widget)")
 except Exception as e:
     logger.critical(f"❌ Ошибка импорта handlers: {e}")
     sys.exit(1)
@@ -41,9 +45,31 @@ except Exception as e:
 async def on_startup():
     logger.info("🚀 Инициализация бота...")
     try:
+        # Закрываем любую активную сессию getUpdates
+        await bot.get_updates(offset=-1, timeout=1)
+        logger.info("✅ Сессия getUpdates закрыта")
+
+        # Удаляем webhook (на случай если был настроен ранее)
+        await bot.delete_webhook()
+        logger.info("✅ Webhook удалён")
+
         from storages.db import init_db
+        from services.widget_session import init_widget_db
+        from services.site_user_map import init_site_user_map
+        from services.conversation_store import init_conversation_store
         await init_db()
-        logger.info("✅ База данных готова")
+        await init_widget_db()
+        await init_site_user_map()
+        await init_conversation_store()
+        logger.info("✅ База данных готова (основная + виджет)")
+        
+        # 🔑 Автоматический бэкап при старте
+        try:
+            from storages.db import backup_database
+            await backup_database()
+            logger.info("💾 Автоматический бэкап создан")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось создать бэкап: {e}")
 
         chat = await bot.get_chat(SUPPORT_GROUP_ID)
         logger.info(f"✅ Форум: {chat.title}")

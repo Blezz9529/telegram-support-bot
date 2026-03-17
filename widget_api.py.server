@@ -1,0 +1,367 @@
+# services/widget_api.py
+"""
+FastAPI сервер для виджета поддержки
+"""
+import asyncio
+import logging
+import os
+import json
+import base64
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import sqlite3
+import aiogram
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# Импорты из проекта
+from main import bot
+from handlers.widget import process_widget_message_to_forum
+from services.widget_session import init_widget_db, save_widget_message
+from services.widget_session import get_session_messages
+from services.widget_session import get_session, create_session, save_widget_message
+from storages.db import get_user
+
+# Настроить логгирование в файл
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('/app/logs/widget-api.log'),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+# === Хранение активных WebSocket соединений ===
+active_connections = {}
+
+# === FastAPI приложение ===
+app = FastAPI(title="Support Widget API")
+
+# CORS для всех источников (на продакшене ограничить)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# === Монтируем статику (виджет) ===
+# Проверяем несколько возможных путей
+STATIC_DIR = "/app/widget/dist"
+if not os.path.exists(STATIC_DIR):
+    STATIC_DIR = "/app/dist"
+if not os.path.exists(STATIC_DIR):
+    STATIC_DIR = "widget/dist"
+    
+if os.path.exists(STATIC_DIR):
+    app.mount("/widget", StaticFiles(directory=STATIC_DIR, html=True), name="widget")
+    logger.info(f"✅ Static files mounted from {STATIC_DIR}")
+else:
+    logger.warning(f"⚠️ Static directory not found, tried: /app/widget/dist, /app/dist, widget/dist")
+
+# === Модели данных ===
+
+class SendMessageRequest(BaseModel):
+    session_id: str
+    text: str
+    attachment: Optional[str] = None  # base64
+    attachment_type: Optional[str] = None
+    username: Optional[str] = None
+    full_name: Optional[str] = None
+
+
+class MessageResponse(BaseModel):
+    id: int
+    text: str
+    sender: str
+    timestamp: str
+    attachment_url: Optional[str] = None
+
+
+class SessionInitRequest(BaseModel):
+    user_id: Optional[int] = None
+    username: Optional[str] = None
+    full_name: Optional[str] = None
+
+
+class SessionInitResponse(BaseModel):
+    session_id: str
+    messages: List[MessageResponse]
+
+
+# === Инициализация ===
+
+@app.on_event("startup")
+async def startup_event():
+    await init_widget_db()
+    logger.info("✅ Widget API запущен")
+
+
+# === REST API Endpoints ===
+
+@app.get("/api/logs")
+async def get_logs(lines: int = 50):
+    """Получить последние логи (для виджета мониторинга)"""
+    try:
+        log_file = "/app/logs/widget-api.log"
+        if os.path.exists(log_file):
+            with open(log_file, 'r', encoding='utf-8') as f:
+                all_lines = f.readlines()
+                return [line.strip() for line in all_lines[-lines:] if line.strip()]
+        else:
+            return ["Лог файл не найден"]
+    except Exception as e:
+        return [f"Ошибка чтения логов: {str(e)}"]
+
+
+@app.post("/api/widget/session/init")
+async def init_session(request: SessionInitRequest) -> SessionInitResponse:
+    """Инициализация новой сессии виджета"""
+    session_id = await create_session(
+        user_id=request.user_id,
+        username=request.username or "",
+        full_name=request.full_name or ""
+    )
+    
+    # Возвращаем приветственное сообщение
+    welcome_msg = MessageResponse(
+        id=0,
+        text="Привет! 👋 Чем могу помочь? Задайте ваш вопрос, и я отвечу как можно скорее.",
+        sender="operator",
+        timestamp=datetime.now().isoformat()
+    )
+    
+    return SessionInitResponse(
+        session_id=session_id,
+        messages=[welcome_msg]
+    )
+
+
+@app.get("/api/widget/messages/{session_id}")
+async def get_messages(session_id: str, limit: int = 50) -> List[MessageResponse]:
+    """Получить историю сообщений сессии"""
+    session = await get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if session.get("is_blocked"):
+        raise HTTPException(status_code=403, detail="Session blocked")
+    
+    messages = await get_session_messages(session_id, limit)
+    
+    return [
+        MessageResponse(
+            id=msg["id"],
+            text=msg["text"],
+            sender=msg["sender"],
+            timestamp=msg["timestamp"].isoformat() if isinstance(msg["timestamp"], datetime) else str(msg["timestamp"]),
+            attachment_url=msg.get("attachment_url")
+        )
+        for msg in messages
+    ]
+
+
+@app.post("/api/widget/message")
+async def send_message(request: SendMessageRequest, background_tasks: BackgroundTasks) -> MessageResponse:
+    """Отправить сообщение в поддержку"""
+    # Проверяем сессию
+    session = await get_session(request.session_id)
+    if not session:
+        # Создаём новую если не найдена
+        session_id = await create_session(
+            user_id=None,
+            username=request.username or "",
+            full_name=request.full_name or ""
+        )
+        session = {"session_id": session_id, "is_blocked": False}
+    else:
+        session_id = session["session_id"]
+    
+    if session.get("is_blocked"):
+        raise HTTPException(status_code=403, detail="Session blocked")
+
+    # Сохраняем сообщение пользователя
+    message_id = await save_widget_message(
+        session_id=session_id,
+        text=request.text,
+        sender="user",
+        attachment_url=request.attachment,
+        attachment_type=request.attachment_type
+    )
+
+    # Если есть attachment (base64), декодируем
+    image_bytes = None
+    if request.attachment:
+        try:
+            # Удаляем data:image/jpeg;base64, префикс если есть
+            attachment_data = request.attachment.split(",")[-1]
+            image_bytes = base64.b64decode(attachment_data)
+            logger.info(f"📎 Получен attachment размером {len(image_bytes)} байт")
+        except Exception as e:
+            logger.error(f"❌ Ошибка декодирования attachment: {e}")
+
+    # Отправляем в AI для обработки
+    background_tasks.add_task(
+        process_widget_message,
+        session_id=session_id,
+        user_message=request.text,
+        image_bytes=image_bytes,
+        filename=f"attachment.{request.attachment_type.split('/')[-1]}" if request.attachment_type else "file"
+    )
+
+    logger.info(f"✅ Сообщение из виджета сохранено и отправлено в обработку: {session_id[:8]}...")
+
+    return MessageResponse(
+        id=message_id,
+        text=request.text,
+        sender="user",
+        timestamp=datetime.now().isoformat(),
+        attachment_url=request.attachment
+    )
+
+
+@app.get("/api/widget/status/{session_id}")
+async def get_operator_status(session_id: str) -> dict:
+    """Получить статус оператора (online/typing)"""
+    session = await get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Пока всегда возвращаем online
+    # В будущем можно проверять, печатает ли оператор
+    return {
+        "status": "online",
+        "operator_name": "Алекс",
+        "typing": False
+    }
+
+
+# === WebSocket для real-time обновлений ===
+
+# Хранилище активных WebSocket подключений
+active_connections: dict[str, WebSocket] = {}
+
+
+@app.websocket("/api/widget/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    """WebSocket для real-time сообщений"""
+    await websocket.accept()
+    active_connections[session_id] = websocket
+    
+    logger.info(f"🔌 WebSocket подключён: {session_id[:8]}...")
+    
+    try:
+        while True:
+            # Получаем данные от клиента (если нужно)
+            data = await websocket.receive_text()
+            
+            # Можно обрабатывать команды от клиента
+            try:
+                message_data = json.loads(data)
+                if message_data.get("type") == "typing":
+                    # Пользователь печатает - можно показать индикатор оператору
+                    pass
+            except json.JSONDecodeError:
+                pass
+    
+    except WebSocketDisconnect:
+        logger.info(f"🔌 WebSocket отключён: {session_id[:8]}...")
+    finally:
+        active_connections.pop(session_id, None)
+
+
+async def send_to_widget(session_id: str, message: dict):
+    """Отправляет сообщение в WebSocket виджета"""
+    if session_id in active_connections:
+        try:
+            await active_connections[session_id].send_json(message)
+            logger.info(f"📤 Отправлено в виджет: {session_id[:8]}...")
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки в виджет: {e}")
+            active_connections.pop(session_id, None)
+
+
+# === Обработка сообщений ===
+
+async def process_widget_message(
+    session_id: str,
+    user_message: str,
+    image_bytes: Optional[bytes] = None,
+    filename: str = ""
+):
+    """Обрабатывает сообщение из виджета через AI и отправляет в форум"""
+    try:
+        session = await get_session(session_id)
+        if not session:
+            return
+        
+        user_id = session.get("user_id")
+        username = session.get("username") or "widget_user"
+        full_name = session.get("full_name") or "Widget User"
+        
+        # Получаем историю сообщений
+        messages = await get_session_messages(session_id, limit=10)
+        history = [
+            {
+                "from_user": msg["sender"] == "user",
+                "text": msg["text"],
+                "has_media": bool(msg.get("attachment_url")),
+                "timestamp": msg["timestamp"].isoformat() if isinstance(msg["timestamp"], datetime) else str(msg["timestamp"])
+            }
+            for msg in messages
+        ]
+        
+        # Вызываем AI для получения ответа
+        from services.ai_agent import process_ticket
+        ai_result = await process_ticket(
+            user_message=user_message,
+            history=history,
+            current_theme=session.get("theme"),
+            user_id=user_id or 0,
+            image_bytes=image_bytes,
+            filename=filename
+        )
+        
+        # Сохраняем ответ ИИ
+        await save_widget_message(
+            session_id=session_id,
+            text=ai_result["response_to_user"],
+            sender="operator"
+        )
+        
+        # Отправляем в WebSocket
+        await send_to_widget(session_id, {
+            "type": "message",
+            "data": {
+                "id": 0,
+                "text": ai_result["response_to_user"],
+                "sender": "operator",
+                "timestamp": datetime.now().isoformat()
+            }
+        })
+        
+        # Отправляем сообщение в форум Telegram
+        await process_widget_message_to_forum(
+            bot=bot,  # Используем bot из main.py
+            session_id=session_id,
+            user_message=user_message,
+            user_id=user_id,
+            username=username,
+            full_name=full_name,
+            image_bytes=image_bytes,
+            filename=filename
+        )
+        
+        logger.info(f"✅ Сообщение из виджета обработано: {session_id[:8]}...")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки сообщения виджета: {e}", exc_info=True)

@@ -5,7 +5,9 @@
     "how_to_play": "Как играть",
     "earn_money": "Хочу заработать",
     "partnership": "Предлагаю сотрудничество",
-    "other_question": "Другой вопрос"
+    "other_question": "Другой вопрос",
+    "close_ticket": "Закрыть вопрос",
+    "new_dialog": "Новый диалог"
   },
   "inline": {
     "block": "🚫 Заблокировать"

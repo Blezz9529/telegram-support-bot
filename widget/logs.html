@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bot Logs - Real-time</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Courier New', monospace;
+            background: #0a0a0a;
+            color: #e5e5e5;
+            padding: 20px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 { color: #ff4444; margin-bottom: 20px; }
+        .controls {
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        .btn-start { background: #22c55e; color: white; }
+        .btn-start:hover { background: #16a34a; }
+        .btn-stop { background: #ef4444; color: white; }
+        .btn-stop:hover { background: #dc2626; }
+        .btn-clear { background: #3b82f6; color: white; }
+        .btn-clear:hover { background: #2563eb; }
+        select {
+            padding: 8px 12px;
+            border-radius: 4px;
+            border: 1px solid #333;
+            background: #1a1a1a;
+            color: #e5e5e5;
+        }
+        .logs {
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+            height: calc(100vh - 200px);
+            overflow-y: auto;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+        .log-entry {
+            padding: 4px 8px;
+            border-bottom: 1px solid #222;
+        }
+        .log-entry:hover { background: #1a1a1a; }
+        .log-time { color: #666; margin-right: 10px; }
+        .log-level {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+        .level-info { background: #3b82f6; color: white; }
+        .level-warning { background: #f59e0b; color: black; }
+        .level-error { background: #ef4444; color: white; }
+        .level-success { background: #22c55e; color: white; }
+        .log-message { color: #e5e5e5; }
+        .highlight { background: #222; }
+        .status {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 10px;
+        }
+        .status-connected { background: #22c55e; animation: pulse 2s infinite; }
+        .status-disconnected { background: #666; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+        }
+        .stat-value { font-size: 24px; font-weight: bold; color: #ff4444; }
+        .stat-label { font-size: 12px; color: #666; margin-top: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 Bot Logs - Real-time Monitor</h1>
+        
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-value" id="totalLogs">0</div>
+                <div class="stat-label">Total Logs</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="errors">0</div>
+                <div class="stat-label">Errors</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="warnings">0</div>
+                <div class="stat-label">Warnings</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="messages">0</div>
+                <div class="stat-label">Messages</div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <span class="status status-disconnected" id="statusIndicator"></span>
+            <span id="statusText">Disconnected</span>
+            <button class="btn-start" onclick="startLogs()">▶ Start</button>
+            <button class="btn-stop" onclick="stopLogs()">⏹ Stop</button>
+            <button class="btn-clear" onclick="clearLogs()">🗑 Clear</button>
+            <select id="logLevel" onchange="filterLogs()">
+                <option value="all">All Levels</option>
+                <option value="INFO">INFO</option>
+                <option value="WARNING">WARNING</option>
+                <option value="ERROR">ERROR</option>
+                <option value="CRITICAL">CRITICAL</option>
+            </select>
+            <select id="autoScroll" checked>
+                <option value="true">Auto Scroll: ON</option>
+                <option value="false">Auto Scroll: OFF</option>
+            </select>
+        </div>
+
+        <div class="logs" id="logsContainer">
+            <div class="log-entry">
+                <span class="log-time">--:--:--</span>
+                <span class="log-level level-info">INFO</span>
+                <span class="log-message">Press "Start" to begin viewing logs...</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let eventSource = null;
+        let lastEventId = 0;
+        let hasStarted = false;
+        let logCount = 0;
+        let errorCount = 0;
+        let warningCount = 0;
+        let messageCount = 0;
+
+        function updateStats(level) {
+            logCount++;
+            document.getElementById('totalLogs').textContent = logCount;
+            
+            if (level === 'ERROR' || level === 'CRITICAL') {
+                errorCount++;
+                document.getElementById('errors').textContent = errorCount;
+            } else if (level === 'WARNING') {
+                warningCount++;
+                document.getElementById('warnings').textContent = warningCount;
+            } else {
+                messageCount++;
+                document.getElementById('messages').textContent = messageCount;
+            }
+        }
+
+        function parseLogLevel(message) {
+            if (message.includes('ERROR') || message.includes('❌')) return 'ERROR';
+            if (message.includes('WARNING') || message.includes('⚠️')) return 'WARNING';
+            if (message.includes('CRITICAL')) return 'CRITICAL';
+            if (message.includes('✅')) return 'SUCCESS';
+            return 'INFO';
+        }
+
+        function getLevelClass(level) {
+            switch(level) {
+                case 'ERROR':
+                case 'CRITICAL': return 'level-error';
+                case 'WARNING': return 'level-warning';
+                case 'SUCCESS': return 'level-success';
+                default: return 'level-info';
+            }
+        }
+
+        function addLogEntry(message, levelOverride, sourceOverride, tsOverride) {
+            const level = levelOverride || parseLogLevel(message);
+            const time = tsOverride
+                ? new Date(tsOverride).toLocaleTimeString('ru-RU')
+                : new Date().toLocaleTimeString('ru-RU');
+            const source = sourceOverride ? `[${sourceOverride}] ` : '';
+            
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.innerHTML = `
+                <span class="log-time">${time}</span>
+                <span class="log-level ${getLevelClass(level)}">${level}</span>
+                <span class="log-message">${escapeHtml(source + message)}</span>
+            `;
+            
+            const container = document.getElementById('logsContainer');
+            container.appendChild(entry);
+            
+            // Auto scroll
+            if (document.getElementById('autoScroll').value === 'true') {
+                container.scrollTop = container.scrollHeight;
+            }
+            
+            updateStats(level);
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function startLogs() {
+            if (eventSource) return;
+            
+            document.getElementById('statusIndicator').className = 'status status-connected';
+            document.getElementById('statusText').textContent = 'Connected';
+            
+            addLogEntry('Connecting to log stream...');
+
+            eventSource = new EventSource('/api/logs/stream');
+
+            eventSource.onopen = () => {
+                document.getElementById('statusIndicator').className = 'status status-connected';
+                document.getElementById('statusText').textContent = 'Connected';
+                if (!hasStarted) {
+                    addLogEntry('Log stream started (SSE)');
+                    hasStarted = true;
+                }
+            };
+
+            eventSource.onmessage = (event) => {
+                try {
+                    if (event.lastEventId) {
+                        const eventId = parseInt(event.lastEventId, 10);
+                        if (!isNaN(eventId) && eventId <= lastEventId) {
+                            return;
+                        }
+                        if (!isNaN(eventId)) {
+                            lastEventId = eventId;
+                        }
+                    }
+                    const payload = JSON.parse(event.data);
+                    addLogEntry(
+                        payload.message || '',
+                        payload.level,
+                        payload.source,
+                        payload.ts
+                    );
+                } catch (e) {
+                    addLogEntry(event.data || 'Invalid log event');
+                }
+            };
+
+            eventSource.onerror = () => {
+                document.getElementById('statusIndicator').className = 'status status-disconnected';
+                document.getElementById('statusText').textContent = 'Disconnected';
+            };
+        }
+
+        function stopLogs() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            hasStarted = false;
+            
+            document.getElementById('statusIndicator').className = 'status status-disconnected';
+            document.getElementById('statusText').textContent = 'Disconnected';
+            addLogEntry('Log stream stopped');
+        }
+
+        function clearLogs() {
+            document.getElementById('logsContainer').innerHTML = '';
+            logCount = 0;
+            errorCount = 0;
+            warningCount = 0;
+            messageCount = 0;
+            updateStats('INFO');
+            addLogEntry('Logs cleared');
+        }
+
+        function filterLogs() {
+            // Implement filtering if needed
+        }
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            stopLogs();
+        });
+    </script>
+</body>
+</html>

@@ -9,8 +9,8 @@ from aiogram.exceptions import (
     TelegramRetryAfter
 )
 from config import SUPPORT_GROUP_ID, ADMINS
-from storages.db import update_user, get_user
-from services.localization import load_button
+from storages.db import update_user, get_user, get_persistent_topic, set_persistent_topic
+from services.localization import load_button, load_text
 
 logger = logging.getLogger(__name__)
 
@@ -30,22 +30,62 @@ async def _topic_exists(bot: Bot, topic_id: int) -> bool:
         return False
 
 
+# 🔑 ПРОВЕРКА: возраст топика (не старше 24 часов)
+async def _topic_is_fresh(bot: Bot, topic_id: int, max_hours: int = 24) -> bool:
+    """Проверяет, что топик был создан недавно"""
+    try:
+        # Получаем информацию о топике через последнее сообщение
+        # Telegram не отдаёт created_at напрямую, но можно проверить по сообщениям
+        from datetime import datetime, timedelta
+        
+        # Получаем последние сообщения в топике
+        messages = []
+        async for msg in bot.get_chat_history(
+            chat_id=SUPPORT_GROUP_ID,
+            message_thread_id=topic_id,
+            limit=1
+        ):
+            messages.append(msg)
+        
+        if not messages:
+            return False  # Топик пустой — старый
+        
+        # Проверяем дату последнего сообщения
+        last_msg_date = messages[0].date
+        now = datetime.now(tz=last_msg_date.tzinfo)
+        age = now - last_msg_date
+        
+        return age.total_seconds() < (max_hours * 3600)
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось проверить возраст топика {topic_id}: {e}")
+        return False  # Если не смогли проверить — считаем старым
+
+
 async def get_or_create_topic(
     bot: Bot,
     user_id: int,
     username: str,
     full_name: str,
-    theme: str
+    theme: str,
+    feedback_type: str = None  # 🔑 Тип отзыва: positive/negative
 ) -> int:
-    user_data = await get_user(user_id)
-    topic_id = user_data.get("topic_id") if user_data else None
-
-    # Проверяем, существует ли топик
+    # Персистентная логика: одна тема на всю жизнь клиента tg:<id>
+    client_key = f"tg:{user_id}"
+    topic_id = await get_persistent_topic(client_key)
     if topic_id and await _topic_exists(bot, topic_id):
+        logger.info(f"📍 Постоянный топик {topic_id} для {user_id}")
         return topic_id
 
     # Создаём новый топик
-    title = f"🆔 {user_id} | @{username or '—'}"
+    # 🔑 Формируем заголовок с тегом отзыва
+    feedback_tag = ""
+    if feedback_type == "positive":
+        feedback_tag = "🟢 "
+    elif feedback_type == "negative":
+        feedback_tag = "🔴 "
+    
+    title = f"{feedback_tag}🆔 {user_id} | @{username or '—'}"
+    
     try:
         topic = await bot.create_forum_topic(
             chat_id=SUPPORT_GROUP_ID,
@@ -53,8 +93,9 @@ async def get_or_create_topic(
             icon_color=0x6FB9F0
         )
         new_id = topic.message_thread_id
-        await update_user(user_id, topic_id=new_id, theme=theme)
-        logger.info(f"✅ Топик {new_id} для {user_id}")
+        await update_user(user_id, topic_id=new_id, theme=theme, feedback_type=feedback_type)
+        await set_persistent_topic(client_key, new_id)
+        logger.info(f"✅ Топик {new_id} для {user_id} (тип: {feedback_type or 'обычный'})")
         return new_id
     except TelegramAPIError as e:
         logger.error(f"❌ Не удалось создать топик: {e}")
@@ -90,15 +131,24 @@ async def send_to_topic(
     bot: Bot,
     user: dict,
     message: Message,
-    theme: str
+    theme: str,
+    feedback_type: str = None  # 🔑 Тип отзыва: positive/negative
 ) -> int:
     topic_id = await get_or_create_topic(
-        bot, user["user_id"], user["username"], user["full_name"], theme
+        bot, user["user_id"], user["username"], user["full_name"], theme, feedback_type
     )
+
+    # 🔑 Добавляем тег отзыва в заголовок сообщения
+    feedback_tag = ""
+    if feedback_type == "positive":
+        feedback_tag = "🟢 <b>Положительный отзыв</b>\n"
+    elif feedback_type == "negative":
+        feedback_tag = "🔴 <b>Отрицательный отзыв</b>\n"
 
     header = (
         f"👤 <b>Пользователь:</b> {user['full_name']} (@{user['username'] or '—'})\n"
         f"🆔 <b>ID:</b> <code>{user['user_id']}</code>\n"
+        f"{feedback_tag}"
         f"📌 <b>Тема:</b> {theme}\n"
         f"──────────────────\n"
     )
@@ -115,7 +165,7 @@ async def send_to_topic(
     if message.photo:
         caption = (header + text_content).strip()
         if not caption:
-            caption = "🖼️ Фото от пользователя"
+            caption = await load_text("photo_from_user")
         sent = await bot.send_photo(
             chat_id=SUPPORT_GROUP_ID,
             photo=message.photo[-1].file_id,
@@ -127,7 +177,7 @@ async def send_to_topic(
     elif message.document:
         caption = (header + text_content).strip()
         if not caption:
-            caption = "📎 Документ от пользователя"
+            caption = await load_text("document_from_user")
         sent = await bot.send_document(
             chat_id=SUPPORT_GROUP_ID,
             document=message.document.file_id,
@@ -139,7 +189,7 @@ async def send_to_topic(
     elif message.video:
         caption = (header + text_content).strip()
         if not caption:
-            caption = "🎬 Видео от пользователя"
+            caption = await load_text("video_from_user")
         sent = await bot.send_video(
             chat_id=SUPPORT_GROUP_ID,
             video=message.video.file_id,
@@ -151,7 +201,7 @@ async def send_to_topic(
     else:
         full_text = (header + text_content).strip()
         if not full_text:
-            full_text = "💬 Пустое сообщение от пользователя"
+            full_text = await load_text("empty_message")
         sent = await send_message_with_retry(
             bot,
             chat_id=SUPPORT_GROUP_ID,

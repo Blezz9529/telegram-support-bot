@@ -5,25 +5,27 @@ import logging
 import asyncio
 import random
 import re
+import base64
 from typing import Any, Dict, List, Optional
 from threading import Lock
 
+# Сначала создаём logger
+logger = logging.getLogger(__name__)
+ENABLE_MEDIA_ANALYSIS = True
+
 try:
-    import google.generativeai as genai
-    from google.generativeai.types import GenerationConfig
-    _GOOGLE_AVAILABLE = True
+    from openai import OpenAI
+    _OPENAI_AVAILABLE = True
+    logger.info("✅ OpenAI библиотека загружена")
 except ImportError as e:
-    _GOOGLE_AVAILABLE = False
-    logging.critical(f"❌ google-generativeai не установлен: {e!r}")
+    _OPENAI_AVAILABLE = False
+    logger.critical(f"❌ openai не установлен: {e!r}")
 
 try:
     import imghdr
     _IMGHDR_AVAILABLE = True
 except ImportError:
     _IMGHDR_AVAILABLE = False
-
-logger = logging.getLogger(__name__)
-ENABLE_MEDIA_ANALYSIS = True
 
 # === Кэш описаний изображений ===
 _image_summaries = {}
@@ -44,16 +46,133 @@ def load_prompts() -> Dict[str, str]:
                 core = data["CORE_STYLE_RULES"]
                 strict = data.get("STRICT_BEHAVIOR_RULES", {})
                 operator = data.get("OPERATOR_RULES", {})
+                topics = data.get("TOPIC_HANDLING", [])
+                examples = data.get("EXAMPLES", {})
+                
                 persona = core.get("persona", "ИИ-агент поддержки")
                 tone = core.get("tone", "кратко, по делу")
                 lang = core.get("language", "Русский")
                 max_sentences = strict.get("max_sentences", 3)
                 operator_prefix = core.get("operator_prefix", "[OPERATOR]")
+                
+                # 🔑 Формируем базовую инструкцию
                 system_instruction = (
                     f"Ты — {persona}. Язык: {lang}. Тон: {tone}. "
                     f"Максимум {max_sentences} предложения в ответе. "
-                    f"Если нужна помощь оператора — начни ответ с {operator_prefix}."
+                    f"Если нужна помощь оператора — начни ответ с {operator_prefix}.\n\n"
                 )
+                
+                # 🔑 ПРАВИЛА ПОВЕДЕНИЯ — ЗАПРЕТЫ
+                system_instruction += (
+                    "🔒 СТРОГИЕ ЗАПРЕТЫ:\n"
+                    "• НЕ сообщай пользователю о передаче оператору или менеджеру\n"
+                    "• НЕ упоминай внутренние процессы (эскалация, заявка, тикет, статус)\n"
+                    "• НЕ пиши что данные некорректные/неправильные — проси прислать ещё раз\n"
+                    "• НЕ говори о системных действиях (создаю топик, фиксирую, передаю)\n"
+                    "• Веди себя как живой человек — оператор поддержки в переписке\n"
+                    "• Если запрос требует участия оператора — просто начни с [OPERATOR] и напиши человеческий ответ\n"
+                    "\n"
+                )
+                
+                # 🔑 ПРИМЕРЫ ПРАВИЛЬНЫХ ОТВЕТОВ
+                system_instruction += (
+                    "📝 ПРИМЕРЫ:\n"
+                    "❌ НЕЛЬЗЯ: \"Передаю ваш запрос оператору\"\n"
+                    "✅ МОЖНО: \"[OPERATOR] Приняла, сейчас проверю вашу информацию\"\n"
+                    "\n"
+                    "❌ НЕЛЬЗЯ: \"Данные некорректные, создаю заявку\"\n"
+                    "✅ МОЖНО: \"Вижу, что чек нечёткий. Пришлите, пожалуйста, ещё раз\"\n"
+                    "\n"
+                    "❌ НЕЛЬЗЯ: \"Ваша заявка передана менеджеру\"\n"
+                    "✅ МОЖНО: \"Приняла. Ожидайте, скоро вернусь с ответом\"\n"
+                    "\n"
+                )
+                
+                # 🔑 Добавляем проверку на дубликаты
+                duplicate_instruction = data.get("DUPLICATE_CHECK_INSTRUCTION", "")
+                if duplicate_instruction:
+                    system_instruction += f"\n{duplicate_instruction}\n"
+                
+                # 🔑 Добавляем правила поведения
+                avoid_words = strict.get("avoid_words", [])
+                if avoid_words:
+                    system_instruction += f"🚫 НЕ используй слова: {', '.join(avoid_words)}.\n"
+                
+                forbidden_styles = strict.get("forbidden_styles", [])
+                if forbidden_styles:
+                    system_instruction += f"🚫 НЕ используй: {', '.join(forbidden_styles)}.\n"
+                
+                one_step = strict.get("one_step_per_message", "")
+                if one_step:
+                    system_instruction += f"📌 {one_step}\n"
+                
+                no_repeated = strict.get("no_repeated_requests", "")
+                if no_repeated:
+                    system_instruction += f"📌 {no_repeated}\n"
+                
+                # 🔑 Добавляем правила по оператору
+                operator_format = operator.get("operator_format", "")
+                if operator_format:
+                    system_instruction += f"\n{operator_format}\n"
+                
+                # 🔑 Добавляем правила по темам (TOPIC_HANDLING)
+                if topics:
+                    system_instruction += "\n=== ПРАВИЛА ПО ТЕМАМ ===\n"
+                    for topic_rule in topics:
+                        topic_name = topic_rule.get("topic", "Неизвестная тема")
+                        operator_rule = topic_rule.get("operator", "AFTER_INFO")
+                        
+                        system_instruction += f"\n📍 {topic_name} (правило: {operator_rule}):\n"
+                        
+                        # Логика для разных типов правил
+                        if "logic" in topic_rule:
+                            logic = topic_rule["logic"]
+                            system_instruction += f"   • Логика: {' '.join(logic)}\n"
+                        
+                        if "cases" in topic_rule:
+                            cases = topic_rule["cases"]
+                            system_instruction += "   • Кейсы:\n"
+                            for case, action in cases.items():
+                                system_instruction += f"     - {case}: {action}\n"
+                        
+                        if "instruction" in topic_rule:
+                            instruction = topic_rule["instruction"]
+                            system_instruction += f"   • Инструкция: {instruction}\n"
+                        
+                        if "steps" in topic_rule:
+                            steps = topic_rule["steps"]
+                            system_instruction += "   • Шаги:\n"
+                            for i, step in enumerate(steps, 1):
+                                system_instruction += f"     {i}. {step}\n"
+                
+                # 🔑 Добавляем примеры (EXAMPLES)
+                if examples:
+                    system_instruction += "\n=== ПРИМЕРЫ ДИАЛОГОВ ===\n"
+                    for example_name, example_dialog in examples.items():
+                        if isinstance(example_dialog, list) and len(example_dialog) > 0:
+                            # Это диалог с примерами
+                            system_instruction += f"\n📘 {example_name}:\n"
+                            for msg in example_dialog:
+                                if isinstance(msg, dict):
+                                    user_text = msg.get("user", "")
+                                    assistant_text = msg.get("assistant", "")
+                                    if user_text and assistant_text:
+                                        system_instruction += f"   Пользователь: {user_text}\n"
+                                        system_instruction += f"   Ассистент: {assistant_text}\n"
+                        elif isinstance(example_dialog, list) and len(example_dialog) > 0:
+                            # Это список неправильных примеров
+                            system_instruction += f"\n🚫 {example_name} (НЕЛЬЗЯ ТАК):\n"
+                            for wrong_example in example_dialog:
+                                system_instruction += f"   • {wrong_example}\n"
+                
+                # 🔑 Добавляем правила анализа изображений
+                if "IMAGE_ANALYSIS" in data:
+                    img = data["IMAGE_ANALYSIS"]
+                    img_format = img.get("format", "1-2 предложения")
+                    reqs = img.get("requirements", [])
+                    system_instruction += f"\n\n=== АНАЛИЗ ИЗОБРАЖЕНИЙ ===\n"
+                    system_instruction += f"Описывай изображение в {img_format}. Укажи: {', '.join(reqs)}.\n"
+
             elif isinstance(system_instruction, dict):
                 persona = system_instruction.get("role_style", {}).get("persona", "ИИ-агент поддержки")
                 tone = system_instruction.get("role_style", {}).get("tone", "кратко, по делу")
@@ -130,58 +249,75 @@ def determine_mime_type(data: bytes, filename: str = "") -> str:
     return 'application/octet-stream'
 
 
-# === Инициализация модели ===
-_gemini_model = None
+# === Инициализация клиента OpenRouter ===
+_openrouter_client = None
 
-def _get_gemini_model() -> Optional["genai.GenerativeModel"]:
-    global _gemini_model
-    if not _GOOGLE_AVAILABLE:
+def _get_openrouter_client() -> Optional["OpenAI"]:
+    global _openrouter_client
+    if not _OPENAI_AVAILABLE:
+        logger.error("❌ OpenAI библиотека недоступна")
         return None
-    if _gemini_model is None:
-        api_key = os.getenv("GEMINI_API_KEY")
+    if _openrouter_client is None:
+        api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
-            logger.error("❌ GEMINI_API_KEY не задан")
+            logger.error("❌ OPENROUTER_API_KEY не задан")
             return None
         try:
-            genai.configure(api_key=api_key)
-            prompts = load_prompts()
-            _gemini_model = genai.GenerativeModel(
-                model_name="gemini-2.0-flash",
-                generation_config=GenerationConfig(
-                    temperature=0.1,
-                    top_p=0.95,
-                    max_output_tokens=768,
-                    response_mime_type="application/json"
-                ),
-                system_instruction=prompts["gemini_system_instruction"]
+            base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+            model_name = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash-lite")
+            
+            _openrouter_client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                default_headers={
+                    "HTTP-Referer": "https://github.com/telegram-support-bot",
+                    "X-OpenRouter-Title": "Telegram Support Bot"
+                }
             )
-            logger.info("✅ Gemini: модель gemini-2.0-flash инициализирована")
+            logger.info(f"✅ OpenRouter: клиент инициализирован (модель: {model_name}, URL: {base_url})")
         except Exception as e:
-            logger.error(f"❌ Gemini: ошибка инициализации: {e}")
+            logger.error(f"❌ OpenRouter: ошибка инициализации: {e}")
             return None
-    return _gemini_model
+    return _openrouter_client
 
 
 # === Очистка ответа (исправлена: удаляет [OPERATOR] из любого места) ===
 def clean_gemini_response(text: str) -> tuple[str, bool]:
     try:
         data = json.loads(text.strip())
-        if isinstance(data, list) and len(data) > 0:
-            text = str(data[0])
-        elif isinstance(data, dict):
-            if "response" in data:
+        
+        # 🔑 OpenRouter JSON формат: {"text": "...", "is_operator": false}
+        if isinstance(data, dict):
+            if "text" in data:
+                text = str(data["text"])
+            elif "response" in data:
                 text = str(data["response"])
             elif "answer" in data:
                 text = str(data["answer"])
-            elif "text" in data:
-                text = str(data["text"])
+            elif "content" in data:
+                text = str(data["content"])
             elif "message" in data:
                 text = str(data["message"])
+        
+        # 🔑 Если массив — берём первый элемент
+        elif isinstance(data, list) and len(data) > 0:
+            first_item = data[0]
+            if isinstance(first_item, dict):
+                if "text" in first_item:
+                    text = str(first_item["text"])
+                elif "response" in first_item:
+                    text = str(first_item["response"])
+                else:
+                    text = str(first_item)
+            else:
+                text = str(first_item)
     except:
         pass
+    
+    # Очищаем от управляющих символов
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text).strip()
 
-    # 🔑 УДАЛЯЕМ [OPERATOR] из любого места в тексте (не только в начале)
+    # 🔑 УДАЛЯЕМ [OPERATOR] из любого места в тексте
     escalation = "[OPERATOR]" in text
     text = text.replace("[OPERATOR]", "").strip()
     # Убираем лишние пробелы после удаления
@@ -203,25 +339,38 @@ async def analyze_and_cache_image(
             logger.info(f"🖼️ Изображение {cache_key} уже проанализировано (из кэша)")
             return _image_summaries[cache_key]
 
-    model = _get_gemini_model()
-    if not model:
-        summary = "[Изображение: Gemini недоступен]"
+    client = _get_openrouter_client()
+    if not client:
+        summary = "[Изображение: OpenRouter недоступен]"
+        logger.warning(f"🖼️ Изображение {cache_key}: OpenRouter клиент не инициализирован")
     else:
         prompts = load_prompts()
         prompt = prompts["gemini_image_analysis_prompt"]
+        
+        # Кодируем изображение в base64
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        mime_type = determine_mime_type(image_bytes, filename)
+        model_name = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash-lite")
+        
+        logger.info(f"🖼️ Анализ изображения {cache_key}: {len(image_bytes)} байт, MIME={mime_type}, модель={model_name}")
+        
         try:
-            loop = asyncio.get_event_loop()
             response = await asyncio.to_thread(
-                model.generate_content,
-                [{"mime_type": "image/jpeg", "data": image_bytes}, prompt]
+                client.chat.completions.create,
+                model=model_name,
+                messages=[
+                    {"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}}
+                    ]}
+                ],
+                max_tokens=256
             )
-            summary = (response.text or "[Изображение: не удалось получить описание]").strip()
+            summary = (response.choices[0].message.content or "[Изображение: не удалось получить описание]").strip()
+            logger.info(f"🖼️ Изображение {cache_key} проанализировано. Результат: {summary}")
         except Exception as e:
-            logger.error(f"❌ Ошибка анализа изображения: {e}")
+            logger.error(f"❌ Ошибка анализа изображения {cache_key}: {e}")
             summary = "[Изображение: ошибка анализа]"
-
-    # ✅ ЛОГИРУЕМ РЕЗУЛЬТАТ АНАЛИЗА
-    logger.info(f"🖼️ Изображение {cache_key} проанализировано. Результат: {summary}")
 
     with _cache_lock:
         _image_summaries[cache_key] = summary
@@ -250,73 +399,87 @@ async def prepare_history_for_prompt(
     return prepared
 
 
-# === Вызов модели с retry и логированием ===
-async def _call_gemini_with_contents(contents: Any) -> Optional[Dict[str, Any]]:
-    model = _get_gemini_model()
-    if not model:
+# === Вызов модели без orchestration retry ===
+async def _call_openrouter_with_messages(
+    messages: List[Dict[str, Any]], 
+    estimated_time: str = ""  # 🔑 Время обработки из промпта
+) -> Optional[Dict[str, Any]]:
+    client = _get_openrouter_client()
+    if not client:
+        logger.error("❌ OpenRouter клиент не инициализирован")
         return None
 
-    # ✅ ЛОГИРУЕМ ПОЛНОСТЬЮ ПРОМПТ
-    logger.info(f"📤 Gemini: промпт (полный):\n{contents}")
+    model_name = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash-lite")
+    temperature = float(os.getenv("GEMINI_TEMPERATURE", "0.1"))
+    max_tokens = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "768"))
 
-    for attempt in range(3):
-        try:
-            response = await asyncio.to_thread(model.generate_content, contents)
-            if not response or not response.text:
-                logger.warning("❌ Gemini: пустой ответ")
-                return None
+    # ✅ ЛОГИРУЕМ ПРОМПТ
+    logger.info(f"📤 OpenRouter: промпт (полный):\n{messages}")
+    logger.info(f"📤 OpenRouter: параметры — модель={model_name}, temp={temperature}, tokens={max_tokens}")
 
-            # ✅ ЛОГИРУЕМ СЫРОЙ ОТВЕТ
-            logger.info(f"📥 Gemini: ответ (сырой):\n{response.text}")
-            clean_text, needs_escalation = clean_gemini_response(response.text)
-            # ✅ ЛОГИРУЕМ ОЧИЩЕННЫЙ ОТВЕТ
-            logger.info(f"✅ Gemini: очищенный ответ: {clean_text}, эскалация: {needs_escalation}")
+    logger.info("🔄 OpenRouter: одиночный вызов без orchestration retry")
 
-            action = "escalate" if needs_escalation else "reply"
-            estimate = "12 часов" if needs_escalation else ""
+    request_params = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens
+    }
+    logger.info(f"🔍 DEBUG: запрос к API: {json.dumps(request_params, ensure_ascii=False)[:500]}...")
 
-            return {
-                "action": action,
-                "response_to_user": clean_text,
-                "escalation_reason": "нужна помощь оператора" if needs_escalation else None,
-                "estimated_time": estimate
-            }
+    response = await asyncio.to_thread(
+        client.chat.completions.create,
+        model=model_name,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens
+    )
 
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "ResourceExhausted" in err_str or "500" in err_str or "gRPC" in err_str:
-                delay = (2 ** attempt) + random.uniform(0, 1)
-                logger.warning(f"⏳ {err_str} — повтор через {delay:.1f} с (попытка {attempt + 1}/3)")
-                await asyncio.sleep(delay)
-                continue
-            else:
-                logger.exception("💥 Другая ошибка Gemini")
-                break
+    logger.info(f"🔍 DEBUG: полный ответ API: choices={len(response.choices) if response.choices else 0}")
 
-    logger.warning("⚠️ Все попытки исчерпаны. Используется fallback с эскалацией")
+    if not response.choices or not response.choices[0].message.content:
+        logger.warning("❌ OpenRouter: пустой ответ")
+        raise RuntimeError("OpenRouter returned empty response")
+
+    raw_text = response.choices[0].message.content
+    logger.info(f"📥 OpenRouter: ответ (сырой):\n{raw_text}")
+    logger.info(f"🔍 DEBUG: тип raw_text={type(raw_text)}, длина={len(raw_text) if raw_text else 0}")
+
+    if hasattr(response, 'usage') and response.usage:
+        logger.info(
+            "📊 OpenRouter: токены — prompt=%s, completion=%s, total=%s",
+            response.usage.prompt_tokens,
+            response.usage.completion_tokens,
+            response.usage.total_tokens,
+        )
+
+    clean_text, needs_escalation = clean_gemini_response(raw_text)
+    logger.info(f"✅ OpenRouter: очищенный ответ: {clean_text}, эскалация: {needs_escalation}")
+
+    action = "escalate" if needs_escalation else "reply"
+    estimate = estimated_time if needs_escalation else ""
+
     return {
-        "action": "escalate",
-        "response_to_user": "Передаю ваш запрос оператору.",
-        "escalation_reason": "ошибка Gemini после 3 попыток",
-        "estimated_time": "12 часов"
+        "action": action,
+        "response_to_user": clean_text,
+        "escalation_reason": "нужна помощь оператора" if needs_escalation else None,
+        "estimated_time": estimate
     }
 
 
-# === Fallback ===
-def _fallback_response(user_message: str, theme: str) -> Dict[str, Any]:
-    text = (user_message or "").lower()
-    if any(t in text for t in ["угроз", "суд", "жалоб", "мошенник"]):
-        return {
-            "action": "escalate",
-            "response_to_user": "Передаю ваш запрос оператору.",
-            "escalation_reason": "триггер в сообщении",
-            "estimated_time": "12 часов"
-        }
-    return {
-        "action": "reply",
-        "response_to_user": "Спасибо за информацию. Оператор скоро свяжется с вами.",
-        "estimated_time": ""
-    }
+# === Получение estimated_time из промпта по теме ===
+def get_estimated_time_for_theme(theme: str) -> str:
+    """Возвращает время обработки для темы из промптов"""
+    try:
+        with open("locales/prompts.json", "r", encoding="utf-8") as f:
+            data = json.loads(f.read())
+            topics = data.get("TOPIC_HANDLING", [])
+            for topic_rule in topics:
+                if topic_rule.get("topic_key") == theme or topic_rule.get("topic") == theme:
+                    return topic_rule.get("estimated_time") or ""
+    except:
+        pass
+    return ""
 
 
 # === Основной вход ===
@@ -332,11 +495,16 @@ async def process_ticket(
     theme = current_theme or "deposit"
     logger.info(f"🆕 Запрос ИИ: user_id={user_id}, тема={theme}, сообщение='{user_message}'")
 
+    # 🔑 0. Получаем estimated_time для темы из промпта
+    estimated_time = get_estimated_time_for_theme(theme)
+    logger.info(f"🕒 Время обработки для темы {theme}: {estimated_time}")
+
     # 🔑 1. Анализ изображения (если есть) → кэшируем
     if ENABLE_MEDIA_ANALYSIS and image_bytes:
         try:
             timestamp = history[-1]["timestamp"] if history else "unknown"
             image_summary = await analyze_and_cache_image(image_bytes, user_id, timestamp, filename)
+            logger.info(f"🖼️ Результат анализа изображения: {image_summary}")
         except Exception as e:
             logger.error(f"❌ Ошибка анализа изображения: {e}")
             image_summary = "[Изображение: ошибка анализа]"
@@ -346,32 +514,46 @@ async def process_ticket(
 
     # 🔑 3. Формируем промпт из файла
     prompts = load_prompts()
-    prompt = prompts["gemini_main_prompt_template"].format(
+    system_instruction = prompts["gemini_system_instruction"]
+    main_prompt_template = prompts["gemini_main_prompt_template"]
+
+    user_prompt = main_prompt_template.format(
         user_id=user_id,
         theme=theme,
         history=prepared_history,
         user_message=user_message
     )
+    
+    logger.info(f"📝 System instruction: {system_instruction[:300]}...")
 
-    # 🔑 4. Подготовка контента
+    # 🔑 4. Подготовка сообщений для OpenRouter
+    messages = [{"role": "system", "content": system_instruction}]
+    
+    # Добавляем изображение в сообщение если есть
     if ENABLE_MEDIA_ANALYSIS and image_bytes:
-        try:
-            mime_type = determine_mime_type(image_bytes, filename)
-            logger.info(f"🖼️ Медиа: {len(image_bytes)} байт, MIME={mime_type}")
-            contents = [
-                {"mime_type": mime_type, "data": image_bytes},
-                prompt
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        mime_type = determine_mime_type(image_bytes, filename)
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}}
             ]
-        except Exception as e:
-            logger.error(f"❌ Ошибка подготовки медиа: {e}")
-            contents = [prompt]
+        })
+        logger.info(f"🖼️ Сообщение с изображением: {len(image_bytes)} байт, MIME={mime_type}")
     else:
-        contents = [prompt]
+        messages.append({"role": "user", "content": user_prompt})
+        logger.info(f"💬 Текстовое сообщение: {len(user_prompt)} символов")
 
-    # 🔑 5. Вызов ИИ
-    ai_result = await _call_gemini_with_contents(contents)
-    if ai_result:
-        return ai_result
+    # 🔑 5. Вызов ИИ с estimated_time
+    ai_result = await _call_openrouter_with_messages(messages, estimated_time)
+    if not ai_result:
+        raise RuntimeError("AI agent returned empty result")
 
-    logger.warning("⚠️ Используется fallback-логика")
-    return _fallback_response(user_message, theme)
+    logger.info(
+        "✅ ИИ ответ: action=%s, response=%s..., time=%s",
+        ai_result["action"],
+        ai_result["response_to_user"][:50],
+        ai_result.get("estimated_time", ""),
+    )
+    return ai_result

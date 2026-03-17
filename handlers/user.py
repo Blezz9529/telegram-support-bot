@@ -5,10 +5,13 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from config import SUPPORT_GROUP_ID, ADMINS
 from storages.db import get_user, create_user, update_user
-from services.ai_agent import process_ticket
-from services.forum import send_to_topic, get_or_create_topic
-from keyboards.reply import get_main_menu
+from services.ai_pipeline import handle_incoming_telegram_message
+from services.conversation_store import clear_conversation_events
+from keyboards.reply import get_main_menu, get_feedback_keyboard
+from services.theme_map import THEME_MAP
+from services.localization import load_text
 import logging
+from datetime import datetime, timedelta, timezone
 
 # ✅ Объявление router
 router = Router()
@@ -18,17 +21,9 @@ logger = logging.getLogger(__name__)
 
 class SupportStates(StatesGroup):
     choosing_theme = State()
+    choosing_feedback_type = State()  # 🔑 Новое состояние для выбора типа отзыва
     in_conversation = State()
 
-
-THEME_MAP = {
-    "Оставить отзыв": "feedback",
-    "Проблема с пополнением": "deposit",
-    "Как играть": "how_to_play",
-    "Хочу заработать": "earn",
-    "Предлагаю сотрудничество": "partnership",
-    "Другой вопрос": "other"
-}
 
 
 @router.message(F.text == "/start")
@@ -36,25 +31,70 @@ async def cmd_start(message: Message, state: FSMContext):
     await create_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
     user = await get_user(message.from_user.id)
     if user and user["is_blocked"]:
-        await message.answer("❌ Вы заблокированы.")
+        await message.answer(await load_text("blocked_user_response"))
         return
 
+    # 🔑 ПРОВЕРКА: есть ли активный диалог
+    current_state = await state.get_state()
+    if current_state == SupportStates.in_conversation:
+        # Пользователь уже в диалоге — спрашиваем подтверждение
+        await message.answer(
+            await load_text("active_dialog_warning"),
+            reply_markup=await get_main_menu()
+        )
+        return
+
+    # 🔑 ПРОВЕРКА: был ли недавний диалог (менее 24 часов)
+    if user and user.get("topic_id") and user.get("theme"):
+        last_message_id = user.get("last_message_id", 0)
+        # Если последнее сообщение было недавно — не сбрасываем
+        # (проверка по времени последнего сообщения в топике)
+        logger.info(f"📍 У пользователя {message.from_user.id} есть топик {user['topic_id']}")
+
+    # Сбрасываем состояние только для нового диалога
     await state.set_data({"conversation_history": []})
     await state.set_state(SupportStates.choosing_theme)
-    await message.answer("Выберите тему:", reply_markup=await get_main_menu())
+    await message.answer(await load_text("select_theme"), reply_markup=await get_main_menu())
 
 
 @router.message(SupportStates.choosing_theme, F.text)
 async def theme_chosen(message: Message, state: FSMContext):
     theme_key = THEME_MAP.get(message.text)
     if not theme_key:
-        await message.answer("Пожалуйста, выберите тему из меню.")
+        await message.answer(await load_text("invalid_theme"))
         return
 
     await update_user(message.from_user.id, first_message_in_ticket=1, theme=theme_key)
     await state.update_data({"theme": theme_key, "conversation_history": []})
+
+    # 🔑 Для отзывов — показываем кнопки выбора типа
+    if theme_key == "feedback":
+        await state.set_state(SupportStates.choosing_feedback_type)
+        await message.answer(await load_text("feedback_type_question"), reply_markup=await get_feedback_keyboard())
+    else:
+        await state.set_state(SupportStates.in_conversation)
+        await message.answer(await load_text("describe_problem"))
+
+
+@router.message(SupportStates.choosing_feedback_type, F.text)
+async def feedback_type_chosen(message: Message, state: FSMContext):
+    """Обработка выбора типа отзыва"""
+    feedback_type = None
+    if message.text == await load_text("feedback_positive"):
+        feedback_type = "positive"
+    elif message.text == await load_text("feedback_negative"):
+        feedback_type = "negative"
+    else:
+        await message.answer(await load_text("feedback_type_invalid"))
+        return
+
+    # Сохраняем тип отзыва в БД и state
+    await update_user(message.from_user.id, feedback_type=feedback_type)
+    await state.update_data({"feedback_type": feedback_type})
+
+    # Переключаемся в режим диалога
     await state.set_state(SupportStates.in_conversation)
-    await message.answer("Опишите проблему.")
+    await message.answer(await load_text("feedback_details_request"))
 
 
 @router.message(SupportStates.in_conversation, F.text | F.photo | F.document)
@@ -66,7 +106,26 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
 
     data = await state.get_data()
     current_theme = data.get("theme")
-    history = data.get("conversation_history", [])
+
+    # 🔑 ПРОВЕРКА: если топик старый (>24 часов) — предупреждаем
+    if user.get("topic_id") and user.get("last_activity"):
+        try:
+            last_dt = datetime.fromisoformat(str(user["last_activity"]))
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            now = datetime.now(tz=last_dt.tzinfo)
+            hours_passed = (now - last_dt).total_seconds() / 3600
+            if hours_passed > 24:
+                logger.info(f"🕒 Пользователь {message.from_user.id} пишет через {hours_passed:.1f} часов")
+                await message.answer(await load_text("old_topic_warning"))
+                await update_user(message.from_user.id, topic_id=None, theme=None)
+                await clear_conversation_events(f"tg:{message.from_user.id}")
+                await state.set_data({"conversation_history": []})
+                await state.set_state(SupportStates.choosing_theme)
+                await message.answer(await load_text("select_theme"), reply_markup=await get_main_menu())
+                return
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось проверить время: {e}")
 
     # Скачиваем медиа
     image_bytes = None
@@ -84,88 +143,19 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
             image_bytes = image_bytes.getvalue()
         filename = message.document.file_name or ""
 
-    # Готовим запись сообщения
-    new_msg = {
-        "from_user": True,
-        "text": message.text or message.caption or "",
-        "has_media": bool(image_bytes),
-        "timestamp": message.date.isoformat()
-    }
-    history.append(new_msg)
-    if len(history) > 10:
-        history = history[-10:]
-    await state.update_data(conversation_history=history)
+    user_text = message.text or message.caption or ""
+    if image_bytes and not user_text.strip():
+        user_text = f"[ИЗОБРАЖЕНИЕ] {filename or 'image'}"
 
-    # 🔑 ПОДГОТОВКА ИСТОРИИ ДЛЯ ИИ: замена байтов на [ИЗОБРАЖЕНИЕ]
-    history_for_ai = []
-    for msg in history:
-        clean_msg = msg.copy()
-        if msg.get("has_media"):
-            clean_msg["text"] = "[ИЗОБРАЖЕНИЕ]"
-        history_for_ai.append(clean_msg)
-
-    # Вызов ИИ (текущее сообщение передаётся отдельно)
-    ai_result = await process_ticket(
-        user_message=new_msg["text"],
-        history=history_for_ai,  # ← только предыдущие сообщения
-        current_theme=current_theme,
-        user_id=message.from_user.id,
+    feedback_type = data.get("feedback_type")
+    await handle_incoming_telegram_message(
+        bot=bot,
+        message=message,
+        user=user,
+        theme=current_theme or "Другой вопрос",
+        feedback_type=feedback_type,
+        user_text=user_text,
         image_bytes=image_bytes,
-        filename=filename
+        filename=filename,
+        attachment_type=message.document.mime_type if message.document else ("image/jpeg" if message.photo else None),
     )
-
-    # Обновляем тему при необходимости
-    if ai_result.get("detected_theme"):
-        await state.update_data(theme=ai_result["detected_theme"])
-        await update_user(message.from_user.id, theme=ai_result["detected_theme"])
-
-    # Получаем/создаём топик
-    topic_id = await get_or_create_topic(
-        bot, user["user_id"], user["username"], user["full_name"], current_theme or "Другой вопрос"
-    )
-
-    # Пересылаем сообщение
-    await send_to_topic(bot, user, message, current_theme or "Другой вопрос")
-
-    # Формируем ответ ИИ в топик
-    ai_text = ai_result["response_to_user"].strip()
-    if ai_result.get("escalation_reason"):
-        ai_text += f"\n\n🔴 Причина эскалации: {ai_result['escalation_reason']}"
-    if ai_result.get("estimated_time"):
-        ai_text += f"\n\n⏱ Время обработки: {ai_result['estimated_time']}"
-
-    await bot.send_message(
-        chat_id=SUPPORT_GROUP_ID,
-        message_thread_id=topic_id,
-        text=f"🧠 <b>ИИ</b>\n{ai_text}",
-        parse_mode="HTML"
-    )
-
-    # Уведомление админов — только при эскалации
-    if ai_result.get("action") == "escalate":
-        admin_tags = " ".join([f"<a href='tg://user?id={a}'>❗</a>" for a in ADMINS])
-        reason = ai_result.get("escalation_reason") or "автоматическая эскалация"
-        await bot.send_message(
-            chat_id=SUPPORT_GROUP_ID,
-            message_thread_id=topic_id,
-            text=f"{admin_tags} <b>❗ УВЕДОМЛЕНИЕ ОПЕРАТОРА</b>\n{reason}",
-            parse_mode="HTML"
-        )
-
-    # Ответ пользователю
-    response_parts = []
-    if user.get("first_message_in_ticket") and ai_result.get("estimated_time"):
-        response_parts.append(f"ℹ️ Время обработки — до {ai_result['estimated_time']}.")
-    response_parts.append(ai_result["response_to_user"])
-    final_response = "\n\n".join(filter(None, response_parts))
-
-    if not final_response.strip():
-        final_response = "Спасибо за информацию. Оператор скоро свяжется с вами."
-
-    await message.answer(final_response)
-
-    # Обновляем историю и флаг
-    history.append({"from_user": False, "text": final_response, "has_media": False})
-    await state.update_data(conversation_history=history[-10:])
-    if user.get("first_message_in_ticket"):
-        await update_user(message.from_user.id, first_message_in_ticket=0)

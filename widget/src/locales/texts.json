@@ -1,0 +1,14 @@
+{
+  "select_theme": "Выберите тему:",
+  "describe_problem": "Опишите проблему.",
+  "feedback_type_question": "Какой у вас отзыв?",
+  "feedback_positive": "😊 Положительный",
+  "feedback_negative": "😞 Отрицательный",
+  "feedback_type_invalid": "Пожалуйста, выберите тип отзыва из кнопок ниже.",
+  "invalid_theme": "Пожалуйста, выберите тему из меню.",
+  "blocked_user_response": "❌ Вы заблокированы.",
+  "active_dialog_warning": "У вас уже есть активный диалог. Начать новый?",
+  "old_topic_warning": "⏱ Прошло много времени. Создаю новую заявку.",
+  "feedback_details_request": "Расскажите подробнее"
+}
+

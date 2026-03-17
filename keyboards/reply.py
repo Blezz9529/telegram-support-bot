@@ -1,5 +1,5 @@
 # keyboards/reply.py
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from services.localization import load_button
 import asyncio
 
@@ -15,13 +15,25 @@ async def get_main_menu() -> ReplyKeyboardMarkup:
     ]
     # Разбиваем на 2 колонки: [ [btn1, btn2, btn3], [btn4, btn5, btn6] ]
     keyboard = [
-        [KeyboardButton(text=btns[i]), KeyboardButton(text=btns[i+3])] 
+        [KeyboardButton(text=btns[i]), KeyboardButton(text=btns[i+3])]
         for i in range(3)
     ]
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
         resize_keyboard=True,
         one_time_keyboard=False  # остаётся, пока не скроем явно
+    )
+
+
+async def get_feedback_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура для отзывов: Положительный / Отрицательный"""
+    keyboard = [
+        [KeyboardButton(text="😊 Положительный"), KeyboardButton(text="😞 Отрицательный")]
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        one_time_keyboard=True  # исчезает после нажатия
     )
 
 

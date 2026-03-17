@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  telegram-bot:
+    build: .
+    container_name: telegram-support-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - bot_data:/app/data
+    networks:
+      - bot_network
+    depends_on:
+      - widget-api
+
+  widget-api:
+    build: .
+    container_name: widget-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - bot_data:/app/data
+      - ./logs:/app/logs
+    ports:
+      - "8001:8000"
+    networks:
+      - bot_network
+    command: ["uvicorn", "services.widget_api:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  log-streamer:
+    build: .
+    container_name: log-streamer
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "8002:8000"
+    networks:
+      - bot_network
+    command: ["uvicorn", "services.log_streamer:app", "--host", "0.0.0.0", "--port", "8000"]
+
+volumes:
+  bot_data:
+    driver: local
+
+networks:
+  bot_network:
+    driver: bridge
