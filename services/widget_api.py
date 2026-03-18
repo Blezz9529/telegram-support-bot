@@ -20,7 +20,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # Импорты из проекта
-from main import bot
+from services.bot_context import get_bot
 from handlers.widget import process_widget_message_to_forum
 from services.widget_session import (
     init_widget_db,
@@ -56,6 +56,8 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+bot = get_bot()
 
 # === FastAPI приложение ===
 app = FastAPI(title="Support Widget API")

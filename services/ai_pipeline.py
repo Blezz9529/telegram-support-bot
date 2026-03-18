@@ -25,6 +25,14 @@ from services.localization import load_text
 
 logger = logging.getLogger(__name__)
 
+_default_bot: Optional[Bot] = None
+
+
+def _set_default_bot(bot: Bot) -> None:
+    global _default_bot
+    if _default_bot is None:
+        _default_bot = bot
+
 BATCH_WINDOW_SECONDS = 10
 AI_PAUSE_SECONDS = 120
 AI_RETRY_DELAYS = (0, 15, 30)
@@ -315,7 +323,10 @@ async def _set_widget_typing(conversation_key: str, typing: bool) -> None:
 
 
 async def run_ai_batch(conversation_key: str) -> None:
-    from main import bot as telegram_bot
+    telegram_bot = _default_bot
+    if telegram_bot is None:
+        logger.error("❌ No bot instance available for AI batch: %s", conversation_key)
+        return
 
     pending = await load_pending_user_tail(conversation_key)
     if not pending:
@@ -482,6 +493,7 @@ async def handle_incoming_telegram_message(
     filename: str = "",
     attachment_type: Optional[str] = None,
 ) -> None:
+    _set_default_bot(bot)
     conversation_key = f"tg:{user['user_id']}"
     attachment_kind = _attachment_kind_from_type(attachment_type)
     event_id = await append_event(
@@ -522,6 +534,7 @@ async def handle_incoming_widget_message(
     filename: str = "",
     attachment_type: Optional[str] = None,
 ) -> None:
+    _set_default_bot(bot)
     from services.widget_session import get_session
 
     session = await get_session(session_id)

@@ -3,9 +3,7 @@ import asyncio
 import logging
 import sys
 import os
-from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram import Dispatcher
 from config import BOT_TOKEN, SUPPORT_GROUP_ID
 
 # Исправление для uvloop на macOS
@@ -22,12 +20,9 @@ logger = logging.getLogger(__name__)
 if os.path.exists("google/__init__.py"):
     sys.path.insert(0, ".")
 
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(
-        parse_mode=ParseMode.HTML
-    )
-)
+from services.bot_context import get_bot
+
+bot = get_bot()
 dp = Dispatcher()
 
 # Импорт хэндлеров
