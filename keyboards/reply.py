@@ -45,3 +45,14 @@ async def get_new_ticket_button() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         one_time_keyboard=True  # исчезает после нажатия
     )
+
+
+async def get_active_dialog_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура подтверждения: продолжить диалог или начать новый"""
+    new_dialog = await load_button("menu", "new_dialog")
+    continue_dialog = await load_button("menu", "continue_dialog")
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=new_dialog), KeyboardButton(text=continue_dialog)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )

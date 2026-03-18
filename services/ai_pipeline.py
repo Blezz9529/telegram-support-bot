@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 
 from aiogram import Bot
 
-from config import ADMINS, SUPPORT_GROUP_ID
+from config import ADMINS, SUPPORT_GROUP_ID, AI_BATCH_WINDOW_SECONDS, AI_OPERATOR_PAUSE_SECONDS
 from services.conversation_store import (
     append_event,
     get_events_for_ai,
@@ -22,6 +22,7 @@ from services.conversation_store import (
     set_batch_id_for_events,
 )
 from services.localization import load_text
+from storages.db import get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +34,6 @@ def _set_default_bot(bot: Bot) -> None:
     if _default_bot is None:
         _default_bot = bot
 
-BATCH_WINDOW_SECONDS = 10
-AI_PAUSE_SECONDS = 120
 AI_RETRY_DELAYS = (0, 15, 30)
 FORUM_RETRY_DELAYS = (30, 120)
 
@@ -49,6 +48,11 @@ def _now() -> datetime:
 
 def _now_iso() -> str:
     return _now().isoformat()
+
+
+async def _is_ai_enabled() -> bool:
+    value = await get_setting("ai_enabled", "1")
+    return str(value).strip() not in {"0", "false", "False"}
 
 
 def _truncate_error(exc: Exception, limit: int = 400) -> str:
@@ -123,7 +127,7 @@ async def _suppress_if_stale(conversation_key: str, generation: int) -> bool:
     return False
 
 
-async def pause_conversation_ai(conversation_key: str, seconds: int = AI_PAUSE_SECONDS) -> int:
+async def pause_conversation_ai(conversation_key: str, seconds: int = AI_OPERATOR_PAUSE_SECONDS) -> int:
     new_generation = await increment_ai_generation(conversation_key)
     await mark_pending_user_tail_consumed(conversation_key, int(time.time() * 1000))
     paused_until = (_now() + timedelta(seconds=seconds)).isoformat()
@@ -150,7 +154,7 @@ async def pause_conversation_ai(conversation_key: str, seconds: int = AI_PAUSE_S
     return new_generation
 
 
-async def schedule_ai_batch(conversation_key: str, delay: int = BATCH_WINDOW_SECONDS) -> None:
+async def schedule_ai_batch(conversation_key: str, delay: int = AI_BATCH_WINDOW_SECONDS) -> None:
     existing = debounce_tasks.pop(conversation_key, None)
     if existing:
         existing.cancel()
@@ -326,6 +330,10 @@ async def run_ai_batch(conversation_key: str) -> None:
     telegram_bot = _default_bot
     if telegram_bot is None:
         logger.error("❌ No bot instance available for AI batch: %s", conversation_key)
+        return
+
+    if not await _is_ai_enabled():
+        logger.info("🛑 AI disabled, batch skipped: conversation=%s", conversation_key)
         return
 
     pending = await load_pending_user_tail(conversation_key)

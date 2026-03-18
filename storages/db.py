@@ -71,6 +71,21 @@ async def init_db():
             """
         )
 
+        # Глобальные настройки (key/value)
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+
+        # Значения по умолчанию для настроек
+        await db.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_enabled', '1')"
+        )
+
         await db.commit()
 
 
@@ -125,6 +140,23 @@ async def update_user(user_id: int, **kwargs):
     values = list(kwargs.values()) + [user_id]
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(f"UPDATE users SET {fields} WHERE user_id = ?", values)
+        await db.commit()
+
+
+async def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = await cur.fetchone()
+        return row["value"] if row else default
+
+
+async def set_setting(key: str, value: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, value)
+        )
         await db.commit()
 
 

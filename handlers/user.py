@@ -1,15 +1,15 @@
 # handlers/user.py
 from aiogram import Router, F, Bot
-from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from config import SUPPORT_GROUP_ID, ADMINS
 from storages.db import get_user, create_user, update_user
 from services.ai_pipeline import handle_incoming_telegram_message
 from services.conversation_store import clear_conversation_events
-from keyboards.reply import get_main_menu, get_feedback_keyboard
+from keyboards.reply import get_main_menu, get_feedback_keyboard, get_active_dialog_keyboard
 from services.theme_map import THEME_MAP
-from services.localization import load_text
+from services.localization import load_text, load_button
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -23,6 +23,7 @@ class SupportStates(StatesGroup):
     choosing_theme = State()
     choosing_feedback_type = State()  # 🔑 Новое состояние для выбора типа отзыва
     in_conversation = State()
+    confirm_new_dialog = State()
 
 
 
@@ -38,9 +39,10 @@ async def cmd_start(message: Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state == SupportStates.in_conversation:
         # Пользователь уже в диалоге — спрашиваем подтверждение
+        await state.set_state(SupportStates.confirm_new_dialog)
         await message.answer(
             await load_text("active_dialog_warning"),
-            reply_markup=await get_main_menu()
+            reply_markup=await get_active_dialog_keyboard()
         )
         return
 
@@ -55,6 +57,30 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.set_data({"conversation_history": []})
     await state.set_state(SupportStates.choosing_theme)
     await message.answer(await load_text("select_theme"), reply_markup=await get_main_menu())
+
+
+@router.message(SupportStates.confirm_new_dialog, F.text)
+async def confirm_new_dialog(message: Message, state: FSMContext):
+    new_dialog = await load_button("menu", "new_dialog")
+    continue_dialog = await load_button("menu", "continue_dialog")
+
+    if message.text == new_dialog:
+        await clear_conversation_events(f"tg:{message.from_user.id}")
+        await update_user(message.from_user.id, theme=None, feedback_type=None, first_message_in_ticket=1)
+        await state.set_data({"conversation_history": []})
+        await state.set_state(SupportStates.choosing_theme)
+        await message.answer(await load_text("select_theme"), reply_markup=await get_main_menu())
+        return
+
+    if message.text == continue_dialog:
+        await state.set_state(SupportStates.in_conversation)
+        await message.answer("Продолжаем диалог.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    await message.answer(
+        await load_text("active_dialog_warning"),
+        reply_markup=await get_active_dialog_keyboard()
+    )
 
 
 @router.message(SupportStates.choosing_theme, F.text)

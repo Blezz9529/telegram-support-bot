@@ -3,7 +3,17 @@ from aiogram import Router, Bot, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from config import SUPPORT_GROUP_ID, ADMINS
-from storages.db import get_user, get_user_by_topic_id, update_user, backup_database, restore_database, get_db_stats, get_backup_list
+from storages.db import (
+    get_user,
+    get_user_by_topic_id,
+    update_user,
+    backup_database,
+    restore_database,
+    get_db_stats,
+    get_backup_list,
+    get_setting,
+    set_setting,
+)
 from services.localization import load_text
 from services.widget_session import get_session_by_user_id, get_session_by_topic_id, get_latest_session_by_site_user_id, block_sessions_by_site_user_id, unblock_sessions_by_site_user_id
 from handlers.widget import send_operator_reply_to_widget
@@ -406,6 +416,22 @@ async def cmd_db_list(message: Message):
         text += f"{i}. <code>{b['name']}</code> — {b['size']} байт, {b['created']}\n"
     
     await message.answer(text)
+
+
+@router.message(Command("ai_on"))
+async def cmd_ai_on(message: Message):
+    if message.from_user.id not in ADMINS:
+        return
+    await set_setting("ai_enabled", "1")
+    await message.answer("✅ ИИ включен")
+
+
+@router.message(Command("ai_off"))
+async def cmd_ai_off(message: Message):
+    if message.from_user.id not in ADMINS:
+        return
+    await set_setting("ai_enabled", "0")
+    await message.answer("⛔ ИИ отключен")
 
 
 def _is_admin(message: Message) -> bool:
