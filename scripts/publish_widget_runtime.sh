@@ -6,6 +6,7 @@ WIDGET_DIR="${WIDGET_DIR:-$PROJECT_ROOT/widget}"
 PUBLIC_ROOT="${PUBLIC_ROOT:-/root/nginx-proxy/html}"
 WIDGET_PUBLIC_PATH="${WIDGET_PUBLIC_PATH:-widget}"
 DEPLOY_LOGS_PAGE="${DEPLOY_LOGS_PAGE:-0}"
+CLEAN_NODE_MODULES="${CLEAN_NODE_MODULES:-1}"
 
 TARGET_WIDGET_DIR="${PUBLIC_ROOT}/${WIDGET_PUBLIC_PATH}"
 
@@ -57,6 +58,10 @@ echo "==> Building widget (docker node preferred, fallback to local)"
 if ! build_with_docker_node; then
   echo ".. docker build failed or docker not available, trying local node"
   build_with_local_node
+fi
+
+if [[ "$CLEAN_NODE_MODULES" == "1" ]]; then
+  rm -rf "$WIDGET_DIR/node_modules" || true
 fi
 
 mkdir -p "$TARGET_WIDGET_DIR"

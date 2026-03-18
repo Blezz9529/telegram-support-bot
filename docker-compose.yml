@@ -2,7 +2,9 @@ version: '3.8'
 
 services:
   telegram-bot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: telegram-support-bot
     restart: unless-stopped
     env_file:
@@ -15,7 +17,9 @@ services:
       - widget-api
 
   widget-api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: widget-api
     restart: unless-stopped
     env_file:
@@ -30,7 +34,9 @@ services:
     command: ["uvicorn", "services.widget_api:app", "--host", "0.0.0.0", "--port", "8000"]
 
   log-streamer:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.logstreamer
     container_name: log-streamer
     restart: unless-stopped
     env_file:

@@ -5,7 +5,6 @@ WORKDIR /app
 # Установка системных зависимостей
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libmagic1 \
-    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 # Копирование requirements и установка Python-зависимостей
