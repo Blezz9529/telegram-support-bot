@@ -123,7 +123,7 @@ async def feedback_type_chosen(message: Message, state: FSMContext):
     await message.answer(await load_text("feedback_details_request"))
 
 
-@router.message(SupportStates.in_conversation, F.text | F.photo | F.document)
+@router.message(SupportStates.in_conversation)
 async def handle_message_in_conversation(message: Message, state: FSMContext, bot: Bot):
     user = await get_user(message.from_user.id)
     if not user or user["is_blocked"]:
@@ -153,25 +153,81 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         except Exception as e:
             logger.warning(f"⚠️ Не удалось проверить время: {e}")
 
-    # Скачиваем медиа
+    # Навигационные кнопки не должны уходить в ИИ
+    nav_texts = {
+        await load_button("menu", "leave_feedback"),
+        await load_button("menu", "deposit_problem"),
+        await load_button("menu", "how_to_play"),
+        await load_button("menu", "earn_money"),
+        await load_button("menu", "partnership"),
+        await load_button("menu", "other_question"),
+        await load_button("menu", "new_dialog"),
+        await load_button("menu", "continue_dialog"),
+        await load_text("feedback_positive"),
+        await load_text("feedback_negative"),
+    }
+
+    is_navigation = bool(message.text) and message.text in nav_texts
+
+    # Скачиваем медиа только для изображений
     image_bytes = None
     filename = ""
+    attachment_type = None
+    attachment_kind = None
     if message.photo:
+        attachment_kind = "image"
         file = await bot.get_file(message.photo[-1].file_id)
         image_bytes = await bot.download_file(file.file_path)
         if hasattr(image_bytes, 'getvalue'):
             image_bytes = image_bytes.getvalue()
         filename = f"photo_{message.photo[-1].file_unique_id}.jpg"
+        attachment_type = "image/jpeg"
+    elif message.sticker:
+        attachment_kind = "sticker"
+        filename = f"sticker_{message.sticker.file_unique_id}"
+        attachment_type = message.sticker.mime_type
+    elif message.animation:
+        attachment_kind = "gif"
+        filename = message.animation.file_name or f"animation_{message.animation.file_unique_id}"
+        attachment_type = message.animation.mime_type
     elif message.document:
-        file = await bot.get_file(message.document.file_id)
-        image_bytes = await bot.download_file(file.file_path)
-        if hasattr(image_bytes, 'getvalue'):
-            image_bytes = image_bytes.getvalue()
         filename = message.document.file_name or ""
+        attachment_type = message.document.mime_type
+        if attachment_type and attachment_type.startswith("image/"):
+            attachment_kind = "image"
+            file = await bot.get_file(message.document.file_id)
+            image_bytes = await bot.download_file(file.file_path)
+            if hasattr(image_bytes, 'getvalue'):
+                image_bytes = image_bytes.getvalue()
+        else:
+            attachment_kind = "other"
+    elif message.video:
+        attachment_kind = "other"
+        attachment_type = message.video.mime_type
+        filename = f"video_{message.video.file_unique_id}"
+    elif message.voice:
+        attachment_kind = "other"
+        attachment_type = message.voice.mime_type
+        filename = f"voice_{message.voice.file_unique_id}"
+    elif message.video_note:
+        attachment_kind = "other"
+        filename = f"video_note_{message.video_note.file_unique_id}"
+    elif message.audio:
+        attachment_kind = "other"
+        attachment_type = message.audio.mime_type
+        filename = message.audio.file_name or f"audio_{message.audio.file_unique_id}"
 
     user_text = message.text or message.caption or ""
-    if image_bytes and not user_text.strip():
-        user_text = f"[ИЗОБРАЖЕНИЕ] {filename or 'image'}"
+    if attachment_kind and attachment_kind in {"gif", "sticker", "other"}:
+        label = attachment_kind.upper()
+        placeholder = f"[ВЛОЖЕНИЕ: {label}] {filename or 'file'}"
+        if user_text.strip():
+            user_text = f"{user_text}\n{placeholder}"
+        else:
+            user_text = placeholder
+    elif not user_text.strip() and attachment_kind:
+        label = attachment_kind.upper()
+        user_text = f"[ВЛОЖЕНИЕ: {label}] {filename or 'file'}"
 
     feedback_type = data.get("feedback_type")
     await handle_incoming_telegram_message(
@@ -183,5 +239,7 @@ async def handle_message_in_conversation(message: Message, state: FSMContext, bo
         user_text=user_text,
         image_bytes=image_bytes,
         filename=filename,
-        attachment_type=message.document.mime_type if message.document else ("image/jpeg" if message.photo else None),
+        attachment_type=attachment_type,
+        attachment_kind=attachment_kind,
+        visible_to_ai=not is_navigation,
     )

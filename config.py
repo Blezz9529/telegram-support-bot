@@ -7,6 +7,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPPORT_GROUP_ID = int(os.getenv("SUPPORT_GROUP_ID", "0"))
 ADMINS = [int(x) for x in os.getenv("ADMINS", "").split(",") if x.strip()]
+TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "")
+TELEGRAM_PROXY_ENABLED = os.getenv("TELEGRAM_PROXY_ENABLED", "0") == "1"
 
 # === Настройки ИИ ===
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.0-flash")

@@ -64,8 +64,10 @@ def _attachment_kind_from_type(attachment_type: Optional[str]) -> Optional[str]:
     if not attachment_type:
         return None
     if attachment_type == "video/mp4":
-        return "animation"
-    return "image"
+        return "gif"
+    if attachment_type.startswith("image/"):
+        return "image"
+    return "other"
 
 
 def _history_text_from_event(event: Dict[str, Any]) -> str:
@@ -75,16 +77,27 @@ def _history_text_from_event(event: Dict[str, Any]) -> str:
     attachment_kind = event.get("attachment_kind")
     if actor == "operator":
         marker = "[ОПЕРАТОР]"
-        if attachment_kind == "animation" and attachment_name:
+        if attachment_kind == "gif" and attachment_name:
             text = f"{text}\n[ОПЕРАТОР_GIF] {attachment_name}".strip()
-        elif attachment_name:
+        elif attachment_kind == "image" and attachment_name:
             text = f"{text}\n[ОПЕРАТОР_ИЗОБРАЖЕНИЕ] {attachment_name}".strip()
+        elif attachment_name:
+            text = f"{text}\n[ОПЕРАТОР_ВЛОЖЕНИЕ] {attachment_name}".strip()
         return f"{marker} {text}".strip()
     if attachment_name and not text.strip():
-        if attachment_kind == "animation":
-            return f"[GIF] {attachment_name}"
-        return f"[ИЗОБРАЖЕНИЕ] {attachment_name}"
+        if attachment_kind == "gif":
+            return f"[ВЛОЖЕНИЕ: GIF] {attachment_name}".strip()
+        if attachment_kind == "sticker":
+            return f"[ВЛОЖЕНИЕ: STICKER] {attachment_name}".strip()
+        if attachment_kind == "image":
+            return f"[ИЗОБРАЖЕНИЕ] {attachment_name}".strip()
+        return f"[ВЛОЖЕНИЕ: FILE] {attachment_name}".strip()
     return text
+
+
+def _strip_operator_prefix(text: str) -> str:
+    cleaned = (text or "").replace("[OPERATOR]", "").strip()
+    return cleaned
 
 
 async def _is_paused(conversation_key: str) -> bool:
@@ -279,7 +292,7 @@ async def _deliver_assistant_reply(
         response_parts = []
         if user and user.get("first_message_in_ticket") and ai_result.get("estimated_time"):
             response_parts.append(await load_text("first_message_time_info", time=ai_result["estimated_time"]))
-        response_parts.append(ai_result["response_to_user"])
+        response_parts.append(_strip_operator_prefix(ai_result["response_to_user"]))
         final_response = "\n\n".join(filter(None, response_parts)).strip() or await load_text("fallback_no_response")
         await bot.send_message(user_id, final_response)
         await update_user(user_id, first_message_in_ticket=0)
@@ -301,7 +314,7 @@ async def _deliver_assistant_reply(
 
     await send_operator_reply_to_widget(
         session_id=session_id,
-        operator_message=ai_result["response_to_user"],
+        operator_message=_strip_operator_prefix(ai_result["response_to_user"]),
         operator_name="Оператор",
     )
     await append_event(
@@ -347,6 +360,18 @@ async def run_ai_batch(conversation_key: str) -> None:
     state = await load_ai_state(conversation_key)
     generation = int(state.get("ai_generation") or 0)
     if await _suppress_if_stale(conversation_key, generation):
+        return
+
+    if any(event.get("attachment_kind") == "other" for event in pending):
+        escalation_text = await load_text("file_escalation_response")
+        ai_result = {
+            "action": "escalate",
+            "response_to_user": escalation_text,
+            "escalation_reason": "вложение не поддерживается ИИ",
+        }
+        await _deliver_assistant_reply(telegram_bot, conversation_key=conversation_key, ai_result=ai_result)
+        for event_id in event_ids:
+            pending_media.pop(event_id, None)
         return
 
     merged_text = "\n".join(
@@ -500,10 +525,12 @@ async def handle_incoming_telegram_message(
     image_bytes: Optional[bytes] = None,
     filename: str = "",
     attachment_type: Optional[str] = None,
+    attachment_kind: Optional[str] = None,
+    visible_to_ai: bool = True,
 ) -> None:
     _set_default_bot(bot)
     conversation_key = f"tg:{user['user_id']}"
-    attachment_kind = _attachment_kind_from_type(attachment_type)
+    attachment_kind = attachment_kind or _attachment_kind_from_type(attachment_type)
     event_id = await append_event(
         conversation_key=conversation_key,
         channel="telegram",
@@ -512,9 +539,9 @@ async def handle_incoming_telegram_message(
         attachment_type=attachment_type,
         attachment_name=filename or None,
         attachment_kind=attachment_kind,
-        visible_to_ai=True,
+        visible_to_ai=visible_to_ai,
     )
-    if image_bytes:
+    if image_bytes and attachment_kind == "image":
         pending_media[event_id] = {"image_bytes": image_bytes, "filename": filename}
 
     async def _send_forum():
@@ -530,7 +557,8 @@ async def handle_incoming_telegram_message(
         logger.exception("💥 Initial forum send failed: conversation=%s event=%s", conversation_key, event_id)
         await mark_forum_failed(event_id)
         asyncio.create_task(_retry_forum_send(_send_forum, event_id=event_id, conversation_key=conversation_key))
-    await schedule_ai_batch(conversation_key)
+    if visible_to_ai:
+        await schedule_ai_batch(conversation_key)
 
 
 async def handle_incoming_widget_message(

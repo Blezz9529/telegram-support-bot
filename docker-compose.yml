@@ -15,6 +15,7 @@ services:
       - bot_network
     depends_on:
       - widget-api
+      - xray-proxy
 
   widget-api:
     build:
@@ -32,6 +33,20 @@ services:
     networks:
       - bot_network
     command: ["uvicorn", "services.widget_api:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      - xray-proxy
+
+  xray-proxy:
+    image: teddysun/xray:latest
+    container_name: xray-proxy
+    restart: unless-stopped
+    volumes:
+      - ./xray/entrypoint.sh:/entrypoint.sh:ro
+    env_file:
+      - .env
+    networks:
+      - bot_network
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
 
   log-streamer:
     build:

@@ -40,5 +40,6 @@
   "operator_reason_prefix": "🔴 Причина эскалации:",
   "processing_time_prefix": "⏱ Время обработки:",
   "first_message_time_info": "ℹ️ Время обработки — до {time}.",
-  "fallback_no_response": "Спасибо за информацию. Оператор скоро свяжется с вами."
-}
+  "fallback_no_response": "Спасибо за информацию. Оператор скоро свяжется с вами.",
+  "file_escalation_response": "Получила файл. Изучаем."
+} 

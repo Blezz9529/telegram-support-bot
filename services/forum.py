@@ -161,44 +161,8 @@ async def send_to_topic(
     )
     reply_markup = InlineKeyboardMarkup(inline_keyboard=[[block_btn]])
 
-    # Отправка в зависимости от типа сообщения
-    if message.photo:
-        caption = (header + text_content).strip()
-        if not caption:
-            caption = await load_text("photo_from_user")
-        sent = await bot.send_photo(
-            chat_id=SUPPORT_GROUP_ID,
-            photo=message.photo[-1].file_id,
-            caption=caption,
-            message_thread_id=topic_id,
-            parse_mode="HTML",
-            reply_markup=reply_markup  # ✅ Кнопка сразу в фото
-        )
-    elif message.document:
-        caption = (header + text_content).strip()
-        if not caption:
-            caption = await load_text("document_from_user")
-        sent = await bot.send_document(
-            chat_id=SUPPORT_GROUP_ID,
-            document=message.document.file_id,
-            caption=caption,
-            message_thread_id=topic_id,
-            parse_mode="HTML",
-            reply_markup=reply_markup  # ✅ Кнопка сразу в документе
-        )
-    elif message.video:
-        caption = (header + text_content).strip()
-        if not caption:
-            caption = await load_text("video_from_user")
-        sent = await bot.send_video(
-            chat_id=SUPPORT_GROUP_ID,
-            video=message.video.file_id,
-            caption=caption,
-            message_thread_id=topic_id,
-            parse_mode="HTML",
-            reply_markup=reply_markup  # ✅ Кнопка сразу в видео
-        )
-    else:
+    # Текстовые сообщения — как раньше
+    if message.content_type == "text":
         full_text = (header + text_content).strip()
         if not full_text:
             full_text = await load_text("empty_message")
@@ -210,6 +174,33 @@ async def send_to_topic(
             parse_mode="HTML",
             reply_markup=reply_markup  # ✅ Кнопка в текстовом сообщении
         )
+    else:
+        # Любые вложения — сначала заголовок, затем копия оригинального сообщения
+        await send_message_with_retry(
+            bot,
+            chat_id=SUPPORT_GROUP_ID,
+            text=header.strip(),
+            message_thread_id=topic_id,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+        try:
+            sent = await bot.copy_message(
+                chat_id=SUPPORT_GROUP_ID,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+                message_thread_id=topic_id,
+            )
+        except Exception:
+            placeholder = (header + (text_content or f"[{message.content_type}]")).strip()
+            sent = await send_message_with_retry(
+                bot,
+                chat_id=SUPPORT_GROUP_ID,
+                text=placeholder,
+                message_thread_id=topic_id,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
 
     # ✅ СОХРАНЯЕМ message_id для отслеживания (но НЕ тэг админов при создании)
     await update_user(user["user_id"], last_message_id=sent.message_id)
